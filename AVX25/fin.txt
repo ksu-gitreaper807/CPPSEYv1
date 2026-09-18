@@ -1,0 +1,198 @@
+[+] loadv79 — ITU-R BT.1702-3 + static-region subtraction + launch timer (v79)
+    Device : x11grab  URL: :0
+    Video  : 1920x1080  FPS: 60
+    SrcFmt : bgr0 -> YUV420p (swscale)
+    Analyse: 1280x720  (downsampled from native)
+    Colour : kr=101/64  (BT.709 forced)
+    Combos : max_sep=10  mask=0x7fbfdfeff7fbfdfe
+    Fixes  : dual-threshold | opposing-pair | concurrent-area
+             | rising-edge-rate | sat-red | strobe-aware-motion-comp | patterns
+    Press Ctrl-C to stop.
+[D] Detection speed capability @ 60 fps:
+    window_span    = 50.0ms  (8 frames, slides 1 frame per analysis call)
+    max_sep        = 7 slots  (adjacency gate: |argmin_slot - argmax_slot| ≤ 7)
+    min_hz [gate]  = 4.29Hz  ← fps / (2 × max_sep).  Flashes below this are NEVER detected.
+    min_hz [cover] = 20.00Hz  ← 1 / window_span.  Below this, both d2b+b2d may not fit in one window.
+    *** 3Hz DETECTION BLOCKED: combo gate lower bound 4.29Hz > 3Hz.
+        Half-period of 3Hz @ 60.00fps = 10.0 frames, but max_sep = 7 (capped by 8-slot ring).
+        Fix: increase ring buffer size beyond 8 frames,
+             or analyse in a wider temporal window. ***
+=== Display Profile ===
+Max Luminance   : 2e+02 nits
+Brightness      : 3e+01%
+Effective nits  : 6e+01 nits
+Active EOTF     : SDR Gamma 2.2
+=======================
+[i] 0s-0.1s  Y_conc=6%  R_conc=6%  SatR=0.0004%  drift=0.2  osc=3  AThresh->2e+01%  excl_Y=6%  excl_R=8%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.6% [safe]
+[D] win=95.8ms  step=0.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=0.0Hz  lag=-1.0ms
+[i] 0.5s-0.6s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0.003%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=49.9ms  step=470.9ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=0.0Hz  lag=-1.0ms
+[i] 0.5s-0.6s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0.003%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.5ms  step=17.3ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=0.0Hz  lag=-1.0ms
+[i] 0.6s-0.6s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0.003%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=16.1ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=0.0Hz  lag=-1.0ms
+[i] 0.9s-1s  Y_conc=6%  R_conc=6%  SatR=0%  drift=1  osc=3  AThresh->2e+01%  excl_Y=7%  excl_R=8%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.7% [safe]
+[D] win=50.0ms  step=350.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.2Hz  lag=-1.0ms
+[i] 0.9s-1s  Y_conc=6%  R_conc=6%  SatR=0%  drift=1  osc=3  AThresh->2e+01%  excl_Y=7%  excl_R=8%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.7% [safe]
+[D] win=52.2ms  step=19.0ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.2Hz  lag=19.0ms
+[i] 0.9s-1s  Y_conc=6%  R_conc=6%  SatR=0%  drift=1  osc=3  AThresh->2e+01%  excl_Y=7%  excl_R=8%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.7% [safe]
+[D] win=51.5ms  step=15.9ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.2Hz  lag=34.9ms
+[i] 1s-1s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=181.8ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.2Hz  lag=-1.0ms
+[i] 1s-1s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.8ms  step=17.6ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.2Hz  lag=-1.0ms
+[i] 1s-1s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=15.8ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.2Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=566.7ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.2Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=16.8ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.2Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=16.6ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.2Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=2%  R_conc=2%  SatR=0.01%  drift=0.2  osc=3  AThresh->2e+01%  excl_Y=4%  excl_R=5%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.3% [safe]
+[D] win=50.0ms  step=150.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.0Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=2%  R_conc=2%  SatR=0.01%  drift=1  osc=3  AThresh->2e+01%  excl_Y=6%  excl_R=7%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.3% [safe]
+[D] win=54.5ms  step=21.2ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:both  is_flash_y=N  hz_est=1.0Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=2%  R_conc=2%  SatR=0.01%  drift=1  osc=3  AThresh->2e+01%  excl_Y=6%  excl_R=7%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.3% [safe]
+[D] win=53.2ms  step=15.5ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:both  is_flash_y=N  hz_est=1.0Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=3%  R_conc=4%  SatR=0.002%  drift=0.9  osc=3  AThresh->2e+01%  excl_Y=5%  excl_R=5%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.4% [safe]
+[D] win=50.0ms  step=13.4ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=20.0Hz  lag=50.0ms
+[i] 2s-2s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.2% [safe]
+[D] win=50.0ms  step=366.6ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=20.0Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.2% [safe]
+[D] win=51.3ms  step=18.0ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=20.0Hz  lag=-1.0ms
+[i] 2s-2s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.2% [safe]
+[D] win=50.0ms  step=15.3ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=20.0Hz  lag=-1.0ms
+[i] 3s-3s  Y_conc=3%  R_conc=3%  SatR=0.0009%  drift=0.4  osc=3  AThresh->2e+01%  excl_Y=4%  excl_R=5%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.4% [safe]
+[D] win=49.9ms  step=550.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.1Hz  lag=-1.0ms
+[i] 3s-3s  Y_conc=2%  R_conc=2%  SatR=0.002%  drift=1  osc=3  AThresh->2e+01%  excl_Y=5%  excl_R=6%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.3% [safe]
+[D] win=53.6ms  step=20.3ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.1Hz  lag=20.3ms
+[i] 3s-3s  Y_conc=2%  R_conc=2%  SatR=0.002%  drift=1  osc=3  AThresh->2e+01%  excl_Y=5%  excl_R=6%  static=1e+02%  active=1e+02%  oy=2  or=2  P=0.3% [safe]
+[D] win=55.9ms  step=19.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.1Hz  lag=39.3ms
+[i] 3s-3s  Y_conc=3%  R_conc=3%  SatR=0.0009%  drift=0.6  osc=3  AThresh->2e+01%  excl_Y=4%  excl_R=5%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.3% [safe]
+[D] win=58.3ms  step=19.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=Y  hz_est=1.1Hz  lag=58.3ms
+[i] 3s-3s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=46.3ms  step=8.3ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=550.0ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=51.1ms  step=17.9ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=1  or=1  P=0.2% [safe]
+[D] win=50.0ms  step=15.5ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=2%  R_conc=2%  SatR=0%  drift=0.3  osc=3  AThresh->2e+01%  excl_Y=3%  excl_R=3%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=350.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=2%  R_conc=2%  SatR=0%  drift=0.3  osc=3  AThresh->2e+01%  excl_Y=3%  excl_R=3%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=53.1ms  step=19.7ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=2%  R_conc=2%  SatR=0%  drift=0.3  osc=3  AThresh->2e+01%  excl_Y=3%  excl_R=3%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=56.3ms  step=20.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.03  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=1%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=54.4ms  step=14.6ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=162.3ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=51.3ms  step=18.2ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 4s-4s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=15.2ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=566.7ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=16.7ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=16.7ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=2%  R_conc=2%  SatR=0%  drift=0.06  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.3ms  step=150.3ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.07  osc=4  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.3% [safe]
+[D] win=52.0ms  step=18.4ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.07  osc=4  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.3% [safe]
+[D] win=50.3ms  step=15.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=1%  R_conc=2%  SatR=0%  drift=0.07  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.7ms  step=16.3ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=366.6ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.5ms  step=17.2ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 5s-5s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=16.2ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 6s-6s  Y_conc=0.5%  R_conc=0.5%  SatR=0%  drift=0.003  osc=3  AThresh->2e+01%  excl_Y=0.5%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=550.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 6s-6s  Y_conc=0.5%  R_conc=0.5%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0.5%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.6ms  step=17.3ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 6s-6s  Y_conc=0.5%  R_conc=0.5%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0.5%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.2ms  step=18.2ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 6s-6s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=14.5ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 7s-7s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.4ms  step=585.8ms  sep=3/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 7s-7s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=54.3ms  step=18.5ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 7s-7s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.5ms  step=14.8ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 7s-7s  Y_conc=1%  R_conc=2%  SatR=0%  drift=0.005  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=330.9ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 7s-7s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.008  osc=4  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.3% [safe]
+[D] win=53.1ms  step=19.9ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 7s-7s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.008  osc=4  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.3% [safe]
+[D] win=53.6ms  step=17.1ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 7s-7s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.008  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=51.2ms  step=14.2ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.8ms  step=549.7ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.9ms  step=16.7ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=15.9ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.5%  R_conc=0.5%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0.5%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=366.6ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.5%  R_conc=0.5%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0.5%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=16.8ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.5%  R_conc=0.5%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0.5%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=16.7ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=166.6ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.4ms  step=17.1ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 8s-8s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=16.3ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=566.6ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.8ms  step=17.5ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=15.9ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=0.1%  R_conc=0.09%  SatR=0%  drift=0.07  osc=3  AThresh->2e+01%  excl_Y=0.03%  excl_R=0.07%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=166.6ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=1%  R_conc=2%  SatR=0%  drift=0.07  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.8ms  step=19.6ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.08  osc=4  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.3% [safe]
+[D] win=51.7ms  step=15.5ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.08  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=51.2ms  step=16.1ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=1%  R_conc=1%  SatR=0%  drift=0.06  osc=3  AThresh->2e+01%  excl_Y=1%  excl_R=2%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=47.2ms  step=15.5ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=333.3ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.6ms  step=19.3ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 9s-9s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=51.4ms  step=15.5ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.5%  R_conc=0.6%  SatR=0%  drift=0.02  osc=3  AThresh->2e+01%  excl_Y=0.6%  excl_R=0.7%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=582.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.5%  R_conc=0.6%  SatR=0%  drift=0.02  osc=3  AThresh->2e+01%  excl_Y=0.6%  excl_R=0.7%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=16.5ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.5%  R_conc=0.6%  SatR=0%  drift=0.02  osc=4  AThresh->2e+01%  excl_Y=0.6%  excl_R=0.7%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.3% [safe]
+[D] win=50.0ms  step=16.7ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=49.9ms  step=16.7ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=51.9ms  step=551.9ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:d2b  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.4ms  step=17.2ms  sep=2/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  AThresh->2e+01%  excl_Y=0%  excl_R=0%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=50.0ms  step=14.2ms  sep=1/7  gate_min=4.3Hz  pair=FAIL:b2d  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.5%  R_conc=0.6%  SatR=0%  drift=0.004  osc=3  AThresh->2e+01%  excl_Y=0.6%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.5ms  step=369.3ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.5%  R_conc=0.6%  SatR=0%  drift=0.004  osc=3  AThresh->2e+01%  excl_Y=0.6%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=54.0ms  step=18.2ms  sep=2/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.5%  R_conc=0.6%  SatR=0%  drift=0.004  osc=3  AThresh->2e+01%  excl_Y=0.6%  excl_R=0.6%  static=1e+02%  active=1e+02%  oy=0  or=0  P=0.2% [safe]
+[D] win=52.4ms  step=15.0ms  sep=1/7  gate_min=4.3Hz  pair=PASS  is_flash_y=N  hz_est=1.1Hz  lag=-1.0ms
+[i] 1e+01s-1e+01s  Y_conc=0.008%  R_conc=0.008%  SatR=0%  drift=0.01  osc=3  ATh

@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""
+perfcmp — Relative benchmarking tool using perf stat
+
+Usage:
+  ./perfcmp <binary1> [args...] -- <binary2> [args...] -i <iterations>
+
+Examples:
+  ./perfcmp ./prog_v1 -- ./prog_v2 -i 5
+  ./perfcmp /usr/bin/gzip myfile.txt -- /usr/bin/pigz myfile.txt -i 10
+  ./perfcmp ./old_sort -n 100000 -- ./new_sort -n 100000 -i 20
+"""
+
+import subprocess
+import sys
+import re
+import os
+import shutil
+import textwrap
+from typing import Optional, Tuple, Dict
+
+# ──────────────────────────────────────────────────────────────────
+# ANSI colour palette
+# ──────────────────────────────────────────────────────────────────
+RED    = "\033[91m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+BLUE   = "\033[94m"
+CYAN   = "\033[96m"
+WHITE  = "\033[97m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RESET  = "\033[0m"
+
+def supports_color() -> bool:
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+if not supports_color():
+    RED = GREEN = YELLOW = BLUE = CYAN = WHITE = BOLD = DIM = RESET = ""
+
+# ──────────────────────────────────────────────────────────────────
+# Human-friendly labels for perf stat counter names
+# ──────────────────────────────────────────────────────────────────
+METRIC_LABELS: Dict[str, str] = {
+    "cycles":              "CPU Cycles",
+    "instructions":        "Instructions",
+    "cache-references":    "Cache References",
+    "cache-misses":        "Cache Misses",
+    "branches":            "Branches",
+    "branch-misses":       "Branch Misses",
+    "task-clock":          "Task Clock (ms)",
+    "context-switches":    "Context Switches",
+    "cpu-migrations":      "CPU Migrations",
+    "page-faults":         "Page Faults",
+    "L1-dcache-loads":     "L1 D-Cache Loads",
+    "L1-dcache-load-misses": "L1 D-Cache Load Misses",
+    "LLC-loads":           "LLC Loads",
+    "LLC-load-misses":     "LLC Load Misses",
+    "time_elapsed":        "Wall Time (s)",
+}
+
+# Metrics where LOWER is better (most perf counters)
+LOWER_IS_BETTER = {
+    "cycles", "cache-misses", "branch-misses", "context-switches",
+    "cpu-migrations", "page-faults", "L1-dcache-load-misses",
+    "LLC-load-misses", "time_elapsed", "task-clock",
+}
+
+
+# ──────────────────────────────────────────────────────────────────
+# Argument parsing
+# ──────────────────────────────────────────────────────────────────
+
+def print_usage(exit_code: int = 0):
+    print(f"""
+{BOLD}perfcmp{RESET} — Relative benchmarking tool using perf stat
+
+{BOLD}USAGE{RESET}
+  ./perfcmp <binary1> [args...] -- <binary2> [args...] -i <iterations>
+
+{BOLD}OPTIONS{RESET}
+  --          Separator between the two commands (required)
+  -i <N>      Number of iterations for each perf run  (default: 5)
+  -h, --help  Show this help message
+
+{BOLD}EXAMPLES{RESET}
+  ./perfcmp ./prog_v1 -- ./prog_v2 -i 10
+  ./perfcmp /bin/gzip data.bin -- /bin/pigz data.bin -i 5
+  ./perfcmp ./sorter -n 50000 -- ./sorter_opt -n 50000 -i 20
+
+{BOLD}NOTES{RESET}
+  • Requires 'perf' (linux-tools-generic / linux-tools-$(uname -r))
+  • Run as root or with kernel.perf_event_paranoid ≤ 1 for full counter access
+    sudo sysctl kernel.perf_event_paranoid=1
+  • Δ% is relative to cmd1. Green = cmd2 improved, Red = cmd2 regressed.
+""")
+    sys.exit(exit_code)
+
+
+def parse_args() -> Tuple[list, list, int]:
+    """Split sys.argv into cmd1, cmd2, and iterations."""
+    raw = sys.argv[1:]
+
+    if not raw or "-h" in raw or "--help" in raw:
+        print_usage(0)
+
+    # Extract -i <N> (anywhere in the arg list)
+    iterations = 5
+    if "-i" in raw:
+        idx = raw.index("-i")
+        if idx + 1 >= len(raw):
+            die("'-i' requires an integer argument, e.g. -i 10")
+        try:
+            iterations = int(raw[idx + 1])
+            if iterations < 1:
+                raise ValueError
+        except ValueError:
+            die(f"'-i' value must be a positive integer, got: {raw[idx+1]!r}")
+        raw = raw[:idx] + raw[idx + 2:]
+
+    if "--" not in raw:
+        die("Missing '--' separator between the two commands.\n"
+            "Usage: ./perfcmp <cmd1...> -- <cmd2...> -i <N>")
+
+    sep = raw.index("--")
+    cmd1 = raw[:sep]
+    cmd2 = raw[sep + 1:]
+
+    if not cmd1:
+        die("cmd1 is empty — provide a binary path before '--'")
+    if not cmd2:
+        die("cmd2 is empty — provide a binary path after '--'")
+
+    return cmd1, cmd2, iterations
+
+
+def die(msg: str):
+    print(f"\n{RED}{BOLD}Error:{RESET} {msg}\n", file=sys.stderr)
+    print(f"Run  {BOLD}./perfcmp --help{RESET}  for usage.", file=sys.stderr)
+    sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────
+# perf stat execution & output parsing
+# ──────────────────────────────────────────────────────────────────
+
+StatEntry = Tuple[float, float]   # (value, variance_pct)
+
+
+def check_perf():
+    if not shutil.which("perf"):
+        die(
+            "'perf' not found in PATH.\n"
+            "  Install: sudo apt install linux-tools-generic linux-tools-$(uname -r)\n"
+            "           sudo dnf install perf\n"
+            "           sudo pacman -S perf"
+        )
+
+
+def run_perf_stat(
+    cmd: list,
+    iterations: int,
+    label: str,
+) -> Tuple[Dict[str, StatEntry], str]:
+    """
+    Execute:  perf stat -r <iterations> -- <cmd...>
+    Returns the parsed stat dict and raw stderr string.
+    """
+    perf_cmd = ["perf", "stat", "-r", str(iterations), "--"] + cmd
+
+    print(f"\n  {DIM}$ {' '.join(perf_cmd)}{RESET}")
+    sys.stdout.flush()
+
+    try:
+        proc = subprocess.run(
+            perf_cmd,
+            stdout=subprocess.PIPE,   # suppress binary stdout noise
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        die(f"Binary not found: {cmd[0]!r}")
+
+    if proc.returncode not in (0, 1):
+        # Some programs exit non-zero deliberately; still parse perf output.
+        # But if stderr is empty it likely crashed before perf could measure.
+        if not proc.stderr.strip():
+            print(
+                f"\n{YELLOW}Warning:{RESET} {cmd[0]} exited with code {proc.returncode} "
+                f"and produced no perf output.",
+                file=sys.stderr,
+            )
+
+    stats = parse_perf_output(proc.stderr)
+    return stats, proc.stderr
+
+
+def parse_perf_output(raw: str) -> Dict[str, StatEntry]:
+    """
+    Parse `perf stat -r N` stderr into a dict:
+      metric_key -> (mean_value, variance_pct)
+
+    Handles both the regular counter lines and the "seconds time elapsed" line.
+    """
+    stats: Dict[str, StatEntry] = {}
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+
+        # ── wall-time line ────────────────────────────────────────
+        # Pattern:  0.123456 +- 0.000123 seconds time elapsed  ( +- 1.23% )
+        #       or: 0.123456 seconds time elapsed
+        m = re.search(
+            r"([\d]+\.[\d]+)\s+(?:\+-\s+[\d\.]+\s+)?seconds time elapsed",
+            stripped,
+        )
+        if m:
+            val = float(m.group(1))
+            var = _extract_variance(stripped)
+            stats["time_elapsed"] = (val, var)
+            continue
+
+        # ── counter lines ─────────────────────────────────────────
+        # Pattern:  1,234,567      cycles   # comment  ( +- 0.10% )
+        #           <not counted>  cache-misses
+        if "<not counted>" in stripped or "<not supported>" in stripped:
+            continue
+
+        m = re.match(
+            r"^([\d,]+(?:\.\d+)?)\s+"   # numeric value (with commas)
+            r"([\w][\w\-\.]+)"           # metric name
+            r"(.*)",                     # rest of line (comment, variance)
+            stripped,
+        )
+        if m:
+            raw_val = m.group(1).replace(",", "")
+            metric  = m.group(2).strip()
+            rest    = m.group(3)
+            try:
+                val = float(raw_val)
+            except ValueError:
+                continue
+            var = _extract_variance(rest)
+            stats[metric] = (val, var)
+
+    return stats
+
+
+def _extract_variance(text: str) -> float:
+    """Pull the ±X.XX% variance from a perf output fragment."""
+    m = re.search(r"\(\s*\+-\s*([\d\.]+)%\s*\)", text)
+    return float(m.group(1)) if m else 0.0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Formatting helpers
+# ──────────────────────────────────────────────────────────────────
+
+def fmt_value(val: float, metric: str) -> str:
+    if metric == "time_elapsed":
+        return f"{val:.6f} s"
+    if metric == "task-clock":
+        return f"{val:.2f} ms"
+    # scale large integers
+    if val >= 1_000_000_000:
+        return f"{val / 1_000_000_000:.3f} G"
+    if val >= 1_000_000:
+        return f"{val / 1_000_000:.3f} M"
+    if val >= 1_000:
+        return f"{val / 1_000:.3f} K"
+    return f"{val:.2f}"
+
+
+def fmt_delta(delta: float, metric: str) -> str:
+    """
+    Colour the delta percentage.
+    For lower-is-better metrics: negative delta (cmd2 smaller) → GREEN.
+    For higher-is-better (e.g. instructions/cycle): positive → GREEN.
+    """
+    lower_better = metric in LOWER_IS_BETTER
+    improved     = (delta < 0) if lower_better else (delta > 0)
+
+    if abs(delta) < 0.5:
+        colour = DIM
+    elif improved:
+        colour = GREEN
+    else:
+        colour = RED
+
+    sign = "+" if delta >= 0 else ""
+    return f"{colour}{sign}{delta:.2f}%{RESET}"
+
+
+def fmt_variance(var: float) -> str:
+    if var == 0.0:
+        return ""
+    return f"{DIM}±{var:.1f}%{RESET}"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Comparison table
+# ──────────────────────────────────────────────────────────────────
+
+COL_METRIC = 24
+COL_VAL    = 14
+COL_VAR    =  8
+COL_DELTA  = 12
+
+
+def _label(metric: str) -> str:
+    return METRIC_LABELS.get(metric, metric)[:COL_METRIC - 1]
+
+
+def _hline(char: str = "─") -> str:
+    total = COL_METRIC + 2 + (COL_VAL + COL_VAR + 3) * 2 + COL_DELTA + 2
+    return char * total
+
+
+def print_comparison(
+    cmd1: list,
+    cmd2: list,
+    stats1: Dict[str, StatEntry],
+    stats2: Dict[str, StatEntry],
+    iterations: int,
+):
+    name1 = os.path.basename(cmd1[0])[:COL_VAL + COL_VAR - 2]
+    name2 = os.path.basename(cmd2[0])[:COL_VAL + COL_VAR - 2]
+
+    all_metrics = _ordered_metrics(stats1, stats2)
+
+    hline  = _hline("─")
+    dline  = _hline("═")
+    total_w = len(hline)
+
+    # ── header banner ────────────────────────────────────────────
+    print(f"\n{BOLD}{CYAN}{dline}{RESET}")
+    title = "perfcmp — Benchmark Comparison Report"
+    pad   = (total_w - len(title)) // 2
+    print(f"{BOLD}{CYAN}{' ' * pad}{title}{RESET}")
+    print(f"{BOLD}{CYAN}{dline}{RESET}")
+
+    # ── run info ─────────────────────────────────────────────────
+    print(f"\n  {DIM}Iterations : {iterations} (via perf stat -r {iterations}){RESET}")
+    print(f"  {BOLD}cmd1{RESET}       : {CYAN}{' '.join(cmd1)}{RESET}")
+    print(f"  {BOLD}cmd2{RESET}       : {CYAN}{' '.join(cmd2)}{RESET}")
+    print(f"\n  {DIM}Δ% = (cmd2 − cmd1) / cmd1 × 100   "
+          f"  {GREEN}green{RESET}{DIM} = improvement   "
+          f"  {RED}red{RESET}{DIM} = regression{RESET}\n")
+
+    # ── column header ────────────────────────────────────────────
+    h_metric = f"{'Metric':<{COL_METRIC}}"
+    h_v1     = f"{'cmd1 (' + name1 + ')':<{COL_VAL + COL_VAR + 1}}"
+    h_v2     = f"{'cmd2 (' + name2 + ')':<{COL_VAL + COL_VAR + 1}}"
+    h_delta  = f"{'Δ%':>{COL_DELTA}}"
+    print(f"  {BOLD}{h_metric}  {h_v1}  {h_v2}  {h_delta}{RESET}")
+    print(f"  {hline}")
+
+    # ── data rows ────────────────────────────────────────────────
+    any_missing = False
+    for metric in all_metrics:
+        entry1 = stats1.get(metric)
+        entry2 = stats2.get(metric)
+
+        if entry1 is None and entry2 is None:
+            continue
+
+        if entry1 is None or entry2 is None:
+            any_missing = True
+
+        s1  = fmt_value(entry1[0], metric)  if entry1 else f"{DIM}N/A{RESET}"
+        s2  = fmt_value(entry2[0], metric)  if entry2 else f"{DIM}N/A{RESET}"
+        v1  = fmt_variance(entry1[1])       if entry1 else ""
+        v2  = fmt_variance(entry2[1])       if entry2 else ""
+
+        if entry1 and entry2 and entry1[0] != 0:
+            delta   = (entry2[0] - entry1[0]) / entry1[0] * 100
+            delta_s = fmt_delta(delta, metric)
+        else:
+            delta_s = f"{DIM}  N/A{RESET}"
+
+        label  = f"{_label(metric):<{COL_METRIC}}"
+        col1   = f"{s1:<{COL_VAL}} {v1:<{COL_VAR + 7}}"   # +7 for ANSI escapes
+        col2   = f"{s2:<{COL_VAL}} {v2:<{COL_VAR + 7}}"
+        delta_f = f"{delta_s:>{COL_DELTA + 14}}"           # +14 for ANSI escapes
+
+        print(f"  {label}  {col1}  {col2}  {delta_f}")
+
+    print(f"  {hline}")
+
+    # ── summary verdict ──────────────────────────────────────────
+    _print_verdict(stats1, stats2)
+
+    if any_missing:
+        print(f"\n  {DIM}Some metrics are missing from one run (counter not available).{RESET}")
+
+    print()
+
+
+def _ordered_metrics(
+    stats1: Dict[str, StatEntry],
+    stats2: Dict[str, StatEntry],
+) -> list:
+    """Return metrics in a logical display order."""
+    preferred = [
+        "time_elapsed", "task-clock", "cycles", "instructions",
+        "branches", "branch-misses", "cache-references", "cache-misses",
+        "L1-dcache-loads", "L1-dcache-load-misses", "LLC-loads", "LLC-load-misses",
+        "page-faults", "context-switches", "cpu-migrations",
+    ]
+    all_keys = set(stats1.keys()) | set(stats2.keys())
+    ordered  = [m for m in preferred if m in all_keys]
+    rest     = sorted(all_keys - set(ordered))
+    return ordered + rest
+
+
+def _print_verdict(
+    stats1: Dict[str, StatEntry],
+    stats2: Dict[str, StatEntry],
+):
+    """Print a one-line overall verdict based on wall time / cycles."""
+    primary = next(
+        (k for k in ("time_elapsed", "cycles") if k in stats1 and k in stats2),
+        None,
+    )
+    if primary is None:
+        return
+
+    v1, _ = stats1[primary]
+    v2, _ = stats2[primary]
+    if v1 == 0:
+        return
+
+    delta = (v2 - v1) / v1 * 100
+    metric_name = "wall time" if primary == "time_elapsed" else "CPU cycles"
+
+    print()
+    if abs(delta) < 0.5:
+        verdict = f"{DIM}cmd2 is roughly equivalent to cmd1 ({metric_name}){RESET}"
+    elif delta < 0:
+        verdict = (
+            f"{GREEN}{BOLD}cmd2 is {abs(delta):.1f}% faster{RESET} than cmd1  "
+            f"{DIM}(lower {metric_name}){RESET}"
+        )
+    else:
+        verdict = (
+            f"{RED}{BOLD}cmd2 is {delta:.1f}% slower{RESET} than cmd1  "
+            f"{DIM}(higher {metric_name}){RESET}"
+        )
+
+    label_w = COL_METRIC + 2
+    print(f"  {'Verdict':<{label_w}} {verdict}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Progress / spinner (cosmetic)
+# ──────────────────────────────────────────────────────────────────
+
+def section_banner(step: int, total: int, cmd: list):
+    name = os.path.basename(cmd[0])
+    print(
+        f"\n{BOLD}[{step}/{total}]{RESET} "
+        f"Running perf stat on {CYAN}{name}{RESET}  "
+        f"{DIM}({' '.join(cmd)}){RESET}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────
+
+def main():
+    cmd1, cmd2, iterations = parse_args()   # --help exits here if requested
+    check_perf()
+
+    # ── intro ─────────────────────────────────────────────────────
+    print(f"\n{BOLD}perfcmp{RESET} — Relative Benchmarking Tool  "
+          f"{DIM}(perf stat -r {iterations}){RESET}")
+    print(f"  {DIM}{'─' * 54}{RESET}")
+    print(f"  {BOLD}cmd1{RESET}  {CYAN}{' '.join(cmd1)}{RESET}")
+    print(f"  {BOLD}cmd2{RESET}  {CYAN}{' '.join(cmd2)}{RESET}")
+    print(f"  {DIM}{'─' * 54}{RESET}")
+
+    section_banner(1, 2, cmd1)
+    stats1, _ = run_perf_stat(cmd1, iterations, "cmd1")
+
+    section_banner(2, 2, cmd2)
+    stats2, _ = run_perf_stat(cmd2, iterations, "cmd2")
+
+    if not stats1:
+        die(
+            "No perf counters parsed for cmd1.\n"
+            "  • Check that the binary exits successfully.\n"
+            "  • Try: sudo sysctl kernel.perf_event_paranoid=1"
+        )
+    if not stats2:
+        die("No perf counters parsed for cmd2.")
+
+    print_comparison(cmd1, cmd2, stats1, stats2, iterations)
+
+
+if __name__ == "__main__":
+    main()
