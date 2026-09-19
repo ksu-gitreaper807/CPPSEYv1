@@ -1049,6 +1049,11 @@ static bool query_display_profile_macos(DisplayProfile* out)
 #include <dirent.h>    // opendir / readdir for sysfs iteration
 #include <fcntl.h>     // open
 #include <unistd.h>    // read / close
+#include <cstdlib>     // std::system (ffmpeg lookup)
+#include <cctype>      // isdigit (portal probe parsing)
+#include <poll.h>      // poll (probe timeout)
+#include <sys/stat.h>  // mkfifo / S_I*
+#include <sys/wait.h>  // waitpid (ffmpeg coprocess)
 #include <cstring>     // strncmp / snprintf
 
 // Parse the EDID RandR property blob to extract max luminance and
@@ -4284,6 +4289,15 @@ static DownsampleConfig make_downsample_config(int native_w, int native_h)
 //
 // The device_url and framerate can be overridden at runtime via argv[1]/argv[2].
 // ─────────────────────────────────────────────────────────────────────────────
+// True when the device URL is an X11 window ID (e.g. "0x05600007") rather
+// than a display name (":0.0").  Window-ID URLs go to x11grab verbatim.
+static bool is_x11_window_id(const char* url) {
+    if (!url || !*url) return false;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(url, &end, 0);
+    return (end != url) && (*end == '\0') && (v != 0);
+}
+
 static CaptureConfig make_capture_config(int argc, char* argv[])
 {
     CaptureConfig cfg;
@@ -4309,10 +4323,22 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
     // Fall back to x11grab when DISPLAY is set (X11 desktop).
     const char* has_display  = std::getenv("DISPLAY");
     const char* has_wayland  = std::getenv("WAYLAND_DISPLAY");
-    if (has_wayland && !has_display) {
-        // Wayland without X11: use kmsgrab (needs video group / CAP_SYS_ADMIN).
-        // PipeWire / xdg-desktop-portal is the recommended long-term path but
-        // requires D-Bus integration beyond the scope of this C++ file.
+    const char* force        = std::getenv("PSE_CAPTURE");  // wayland|x11|kms
+
+    if (has_wayland && (!force || std::string(force) == "wayland")) {
+        // Wayland session → xdg-desktop-portal + PipeWire (default).
+        // On Plasma Wayland the X11 root window is an EMPTY background
+        // surface even though XWayland sets DISPLAY, so x11grab would
+        // see nothing; the portal captures the compositor's real output.
+        cfg.input_format = "wayland_pipewire";
+        cfg.device_url   = "type=screen";
+        cfg.framerate    = "60";
+        cfg.video_size   = nullptr;        // probed at runtime (portal)
+        cfg.pixel_format = nullptr;
+        cfg.needs_swscale = true;          // PipeWire BGRA → BGR0 pipeline
+    } else if (!has_display && force && std::string(force) == "kms") {
+        // Bare-metal Wayland without the portal: kmsgrab (video group /
+        // CAP_SYS_ADMIN).
         cfg.input_format = "kmsgrab";
         cfg.device_url   = "";             // primary KMS plane
         cfg.framerate    = "60";
@@ -4320,7 +4346,7 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
         cfg.pixel_format = "bgr0";
         cfg.needs_swscale = true;
     } else {
-        // X11 (or XWayland) session.
+        // X11 (or forced X11/XWayland) session.
         cfg.input_format = "x11grab";
         cfg.device_url   = has_display ? has_display : ":0.0";
         cfg.framerate    = "60";
@@ -4331,8 +4357,17 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
 #endif
 
     // Allow argv[1] = device override, argv[2] = framerate override.
-    if (argc > 1 && argv[1][0] != '\0') cfg.device_url = argv[1];
-    if (argc > 2 && argv[2][0] != '\0') cfg.framerate  = argv[2];
+    // The URL selects the backend: "wayland[:...]" → portal capture,
+    // ":N[.S][+x,y]" or an X11 window ID → x11grab.
+    if (argc > 1 && argv[1][0] != '\0') {
+        cfg.device_url = argv[1];
+        const std::string u = argv[1];
+        if (u == "wayland" || u.rfind("wayland:", 0) == 0)
+            cfg.input_format = "wayland_pipewire";
+        else if (u[0] == ':' || is_x11_window_id(u.c_str()))
+            cfg.input_format = "x11grab";
+    }
+    if (argc > 2 && argv[2][0] != '\0') cfg.framerate = argv[2];
 
     return cfg;
 }
@@ -4368,13 +4403,6 @@ static std::string query_display_geometry_linux(const char* display_env)
 // the detector accepts a window ID as the device URL:
 //     ./detector 0x05600007 60
 // ─────────────────────────────────────────────────────────────────────────────
-static bool is_x11_window_id(const char* url) {
-    if (!url || !*url) return false;
-    char* end = nullptr;
-    const unsigned long v = std::strtoul(url, &end, 0);
-    return (end != url) && (*end == '\0') && (v != 0);
-}
-
 // Window geometry for the video_size option (a window ID is not an openable
 // display, so query_display_geometry_linux cannot be used in window mode).
 static std::string query_window_geometry_linux(const char* window_id_str)
@@ -4394,6 +4422,246 @@ static std::string query_window_geometry_linux(const char* window_id_str)
     return s;
 }
 #endif
+
+// ============================================================================
+// Wayland capture — xdg-desktop-portal + PipeWire (Linux)
+//
+// On a Wayland session (e.g. KDE Plasma Wayland with rootless XWayland)
+// x11grab can only see the X11 ROOT window, which is just an empty
+// background surface — the real screen is composed by the Wayland
+// compositor and never touches X.  The standard Wayland capture path is
+// xdg-desktop-portal (RemoteDesktop), which delivers frames through
+// PipeWire.  FFmpeg's 'pipewire' input device implements exactly that
+// portal handshake, so this front end shells out:
+//
+//   probe : ffmpeg -f pipewire -i "type=screen" -frames:v 1 -f null -
+//           (triggers the screen-share permission prompt; parses WxH)
+//   live  : ffmpeg -f pipewire -i "type=screen" -f rawvideo -pix_fmt bgra -
+//           (stdout → FIFO → FFmpeg rawvideo demuxer → existing pipeline)
+//
+// The downstream pipeline is unchanged: PipeWire frames are 4-byte
+// B,G,R,α pixels — the same B,G,R bytes the BGR0→YUV420p converter
+// consumes (the 4th byte is ignored).
+// ============================================================================
+#if defined(__linux__)
+struct WaylandCapture {
+    pid_t       child_pid = -1;   // live ffmpeg coprocess
+    int         rwfd      = -1;   // O_RDWR anchor on the FIFO
+    std::string fifo_dir;
+    std::string fifo_path;
+    bool        active  = false;
+};
+
+static void wayland_capture_cleanup(WaylandCapture* wc) {
+    if (!wc || !wc->active) return;
+    if (wc->child_pid > 0) {
+        kill(wc->child_pid, SIGTERM);
+        int st = 0;
+        for (int i = 0; i < 100; ++i) {
+            if (waitpid(wc->child_pid, &st, WNOHANG) != 0) break;
+            usleep(20 * 1000);
+        }
+        waitpid(wc->child_pid, &st, 0);   // reap if it lingered
+        wc->child_pid = -1;
+    }
+    if (wc->rwfd >= 0) { close(wc->rwfd); wc->rwfd = -1; }
+    if (!wc->fifo_path.empty()) unlink(wc->fifo_path.c_str());
+    if (!wc->fifo_dir.empty())  rmdir(wc->fifo_dir.c_str());
+    wc->fifo_path.clear();
+    wc->fifo_dir.clear();
+    wc->active = false;
+}
+
+// Run a single-frame PipeWire/portal capture and parse the screen "WxH"
+// from ffmpeg's stream info.  The portal's screen-share prompt appears
+// during this call; blocks up to timeout_s waiting for the user to approve.
+static bool wayland_portal_probe(const std::string& type_spec,
+                                 std::string& size_out, int timeout_s,
+                                 std::string& err_out) {
+    int cpipe[2];
+    if (pipe(cpipe) != 0) { err_out = "pipe() failed"; return false; }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(cpipe[0]); close(cpipe[1]);
+        err_out = "fork() failed"; return false;
+    }
+    if (pid == 0) {
+        // Child: stderr → pipe, then exec (no C++ runtime past this point).
+        dup2(cpipe[1], 2);
+        close(cpipe[0]); close(cpipe[1]);
+        const char* args[] = {
+            "ffmpeg", "-hide_banner", "-loglevel", "info",
+            "-f", "pipewire", "-i", type_spec.c_str(),
+            "-frames:v", "1", "-f", "null", "-", nullptr };
+        execvp("ffmpeg", const_cast<char* const*>(args));
+        _exit(127);   // exec failed (e.g. ffmpeg not in PATH)
+    }
+    close(cpipe[1]);
+
+    std::string buf;
+    char tmp[4096];
+    const auto t_start = std::chrono::steady_clock::now();
+    bool exited = false;
+    while (!exited) {
+        pollfd pfd{ cpipe[0], POLLIN, 0 };
+        const int pr = poll(&pfd, 1, 200);
+        if (pr > 0) {
+            const ssize_t n = read(cpipe[0], tmp, sizeof(tmp));
+            if (n > 0) buf.append(tmp, (size_t)n);
+        }
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) > 0) {
+            exited = true;
+            for (;;) {   // drain the remainder
+                pollfd p2{ cpipe[0], POLLIN, 0 };
+                if (poll(&p2, 1, 0) <= 0) break;
+                const ssize_t n = read(cpipe[0], tmp, sizeof(tmp));
+                if (n <= 0) break;
+                buf.append(tmp, (size_t)n);
+            }
+            break;
+        }
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        if (elapsed > timeout_s) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+            close(cpipe[0]);
+            err_out = "timed out waiting for the screen-share prompt / portal";
+            return false;
+        }
+    }
+    close(cpipe[0]);
+
+    // Parse the first WxH on the video stream line.
+    const std::string marker = "Stream #0:0: Video";
+    const size_t m = buf.find(marker);
+    if (m != std::string::npos) {
+        const size_t line_end = buf.find('\n', m);
+        size_t i = m;
+        while (i < buf.size() && (line_end == std::string::npos || i < line_end)) {
+            if (std::isdigit((unsigned char)buf[i])) {
+                size_t j = i;
+                while (j < buf.size() && std::isdigit((unsigned char)buf[j])) ++j;
+                if (j < buf.size() && buf[j] == 'x') {
+                    size_t k = j + 1;
+                    while (k < buf.size() && std::isdigit((unsigned char)buf[k])) ++k;
+                    if (k > j + 1) { size_out = buf.substr(i, k - i); return true; }
+                }
+                i = j;
+            } else ++i;
+        }
+    }
+    err_out = "no WxH in portal probe output";
+    const size_t err_hint = buf.rfind("Error");
+    if (err_hint != std::string::npos) {
+        const size_t e2 = buf.find('\n', err_hint);
+        err_out = buf.substr(err_hint,
+                             e2 == std::string::npos ? std::string::npos : e2 - err_hint);
+    }
+    const size_t nl = buf.rfind('\n');
+    if (nl != std::string::npos && buf.size() - nl > 2 && err_hint == std::string::npos)
+        err_out = buf.substr(nl + 1);
+    return false;
+}
+
+// Open the Wayland (portal/PipeWire) capture: probe the screen size, spawn
+// the rawvideo ffmpeg coprocess writing to a FIFO, and return an
+// AVFormatContext over that FIFO — the regular av_read_frame loop consumes
+// it exactly like an x11grab context.
+static AVFormatContext* open_wayland_capture(const CaptureConfig& cfg,
+                                             std::string& video_size_storage,
+                                             WaylandCapture& wc) {
+    if (std::system("command -v ffmpeg >/dev/null 2>&1") != 0) {
+        std::cerr << "[!] Wayland capture needs the 'ffmpeg' binary in PATH\n"
+                  << "    (its 'pipewire' input device speaks the portal).\n"
+                  << "    Check:  ffmpeg -hide_banner -formats | grep -i pipewire\n"
+                  << "    Or force the X11/XWayland path:  PSE_CAPTURE=x11 ./detector\n";
+        return nullptr;
+    }
+
+    std::string size, err;
+    std::cerr << "[*] Wayland screen capture via xdg-desktop-portal + PipeWire.\n"
+              << "    A 'share screen' permission dialog may appear — approve it.\n";
+    if (!wayland_portal_probe("type=screen", size, 180, err)) {
+        std::cerr << "[!] PipeWire/portal probe failed: " << err << "\n"
+                  << "    Is xdg-desktop-portal running?  Try PSE_CAPTURE=x11 to\n"
+                  << "    fall back to X11/XWayland (window) capture.\n";
+        return nullptr;
+    }
+    video_size_storage = size;
+
+    char dir_tmpl[] = "/tmp/pse_fw_XXXXXX";
+    char* dir = mkdtemp(dir_tmpl);
+    if (!dir) {
+        std::cerr << "[!] mkdtemp failed: " << std::strerror(errno) << "\n";
+        return nullptr;
+    }
+    wc.fifo_dir  = dir;
+    wc.fifo_path = std::string(dir) + "/stream";
+    if (mkfifo(wc.fifo_path.c_str(), 0600) != 0) {
+        std::cerr << "[!] mkfifo failed: " << std::strerror(errno) << "\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+
+    // O_RDWR anchor: unblocks the child's writer open and the demuxer's
+    // reader open regardless of startup ordering.
+    wc.rwfd = open(wc.fifo_path.c_str(), O_RDWR);
+    if (wc.rwfd < 0) {
+        std::cerr << "[!] open(FIFO) failed: " << std::strerror(errno) << "\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "[!] fork failed: " << std::strerror(errno) << "\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+    if (pid == 0) {
+        // Child: stdout → FIFO, then exec ffmpeg (no C++ runtime past this).
+        const int wfd = open(wc.fifo_path.c_str(), O_WRONLY);
+        if (wfd >= 0) dup2(wfd, 1);
+        if (wfd > 1) close(wfd);
+        close(wc.rwfd);
+        const char* args[] = {
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "pipewire", "-i", "type=screen",
+            "-an", "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-", nullptr };
+        execvp("ffmpeg", const_cast<char* const*>(args));
+        _exit(127);
+    }
+    wc.child_pid = pid;
+
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "video_size",   size.c_str(),  0);
+    av_dict_set(&opts, "pixel_format", "bgra",        0);
+    av_dict_set(&opts, "framerate",    cfg.framerate, 0);
+    AVFormatContext* ctx = nullptr;
+    const AVInputFormat* raw = av_find_input_format("rawvideo");
+    const int ret = avformat_open_input(&ctx, wc.fifo_path.c_str(), raw, &opts);
+    av_dict_free(&opts);
+    if (ret < 0) {
+        char e[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, e, sizeof(e));
+        std::cerr << "[!] Cannot open rawvideo capture stream: " << e << "\n";
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) > 0)
+            std::cerr << "    (ffmpeg coprocess exited early — check portal\n"
+                      << "     permissions / 'ffmpeg -f pipewire -i type=screen -f null -')\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+    wc.active = true;
+    std::cerr << "[*] Wayland capture live: " << size
+              << " @ " << cfg.framerate << " fps (portal/PipeWire)\n";
+    return ctx;
+}
+#endif  // __linux__
 
 // ============================================================================
 // open_screen_capture
@@ -4418,8 +4686,16 @@ static std::string query_window_geometry_linux(const char* window_id_str)
 //                    than buffering several seconds of frames to probe.
 // ============================================================================
 static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
-                                            std::string& video_size_storage)
+                                            std::string& video_size_storage,
+                                            void* wayland_wc)
 {
+#if defined(__linux__)
+    if (std::string(cfg.input_format) == "wayland_pipewire")
+        return wayland_wc
+            ? open_wayland_capture(cfg, video_size_storage,
+                                   *(WaylandCapture*)wayland_wc)
+            : nullptr;
+#endif
     // Must be called before any avformat_open_input with a device URL.
     avdevice_register_all();
 
@@ -4524,8 +4800,18 @@ int main(int argc, char* argv[]) {
     std::string video_size_storage; // lifetime must outlive open_screen_capture
     CaptureConfig cfg = make_capture_config(argc, argv);
 
+#if defined(__linux__)
+    WaylandCapture wc_capture;   // portal/PipeWire coprocess state (Wayland)
+#endif
+
     // ── Open the screen capture device ───────────────────────────────────
-    AVFormatContext* fmt_ctx = open_screen_capture(cfg, video_size_storage);
+#if defined(__linux__)
+    AVFormatContext* fmt_ctx = open_screen_capture(cfg, video_size_storage,
+                                                   &wc_capture);
+#else
+    AVFormatContext* fmt_ctx = open_screen_capture(cfg, video_size_storage,
+                                                   nullptr);
+#endif
     if (!fmt_ctx) return -1;
 
     // avformat_find_stream_info on a live device buffers frames.
@@ -4688,7 +4974,9 @@ int main(int argc, char* argv[]) {
     DisplayProfile   dp = get_updated_display_profile();
 
     std::cout << "[+] loadv82 — dual-detector ITU-R BT.1702-3 PSE (fast 8-slot + slow 16-slot)\n"
-              << "    Device : " << cfg.input_format
+              << "    Device : "
+              << (std::string(cfg.input_format) == "wayland_pipewire"
+                      ? "wayland (pipewire/portal)" : cfg.input_format)
               << "  URL: "       << cfg.device_url << "\n"
               << "    Video  : " << cp->width << "x" << cp->height
               << "  FPS: "       << fps << "\n"
@@ -4708,6 +4996,7 @@ int main(int argc, char* argv[]) {
               << "    Workers: 4 total (w1+w2=fast, w3+w4=slow)\n"
               << "    Fixes  : dual-threshold | opposing-pair | concurrent-area\n"
               << "             | rising-edge-rate | sat-red | strobe-aware-motion-comp | patterns\n"
+              << "             | wayland-portal-capture\n"
               << "    Press Ctrl-C to stop.\n";
 
     // ── Detection speed capability summary ───────────────────────────────
@@ -4846,6 +5135,9 @@ int main(int argc, char* argv[]) {
     else                 run_capture.operator()<false, false>();
 
     // ── Cleanup ───────────────────────────────────────────────────────────
+#if defined(__linux__)
+    wayland_capture_cleanup(&wc_capture);   // stop the ffmpeg coprocess + FIFO
+#endif
     if (sws_ds)   sws_freeContext(sws_ds);
     if (ds_frame) av_frame_free(&ds_frame);
     if (yuv_frame) av_frame_free(&yuv_frame);
