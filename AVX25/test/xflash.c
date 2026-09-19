@@ -42,7 +42,7 @@ int main(int argc, char **argv)
     int  scr  = DefaultScreen(dpy);
     int  W    = DisplayWidth(dpy, scr);
     int  H    = DisplayHeight(dpy, scr);
-    GC   gc   = DefaultGC(dpy);
+    GC   gc   = DefaultGC(dpy, scr);
 
     XSetWindowAttributes attr;
     attr.background_pixel  = BlackPixel(dpy, scr);
@@ -72,7 +72,7 @@ int main(int argc, char **argv)
         if (t >= duration) break;
         int on = ((int)(t / period)) % 2 == 0;
         if (on != prev_on) {
-            XSetForeground(dpy, w, on ? white : black);
+            XSetForeground(dpy, gc, on ? white : black);
             XFillRectangle(dpy, w, gc, 0, 0, W, H);
             XFlush(dpy);
             prev_on = on;
