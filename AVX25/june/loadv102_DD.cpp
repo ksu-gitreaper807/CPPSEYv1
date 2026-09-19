@@ -4356,6 +4356,43 @@ static std::string query_display_geometry_linux(const char* display_env)
     XCloseDisplay(dpy);
     return std::to_string(w) + "x" + std::to_string(h);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// X11 window-ID capture (rootless XWayland support)
+//
+// On rootless XWayland (modern KDE Plasma Wayland, Xwayland -rootless) the
+// X11 ROOT window is only the background surface — X11 client windows are
+// mapped as individual Wayland surfaces and are NEVER visible to root grabs.
+// x11grab ":0" then sees wallpaper only, no matter what the user watches.
+// x11grab can instead capture a specific window by its X11 window ID, so
+// the detector accepts a window ID as the device URL:
+//     ./detector 0x05600007 60
+// ─────────────────────────────────────────────────────────────────────────────
+static bool is_x11_window_id(const char* url) {
+    if (!url || !*url) return false;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(url, &end, 0);
+    return (end != url) && (*end == '\0') && (v != 0);
+}
+
+// Window geometry for the video_size option (a window ID is not an openable
+// display, so query_display_geometry_linux cannot be used in window mode).
+static std::string query_window_geometry_linux(const char* window_id_str)
+{
+    char* end = nullptr;
+    const unsigned long wid = std::strtoul(window_id_str, &end, 0);
+    Display* dpy = XOpenDisplay(nullptr);   // $DISPLAY
+    if (!dpy || wid == 0) {
+        if (dpy) XCloseDisplay(dpy);
+        return "1920x1080";
+    }
+    XWindowAttributes wa;
+    std::string s = "1920x1080";
+    if (XGetWindowAttributes(dpy, (Window)wid, &wa) == Success)
+        s = std::to_string(wa.width) + "x" + std::to_string(wa.height);
+    XCloseDisplay(dpy);
+    return s;
+}
 #endif
 
 // ============================================================================
@@ -4404,9 +4441,15 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
     // x11grab requires an explicit size.
     const char* vsize = cfg.video_size;
 #if defined(__linux__)
+    const bool window_id_mode =
+        (std::string(cfg.input_format) == "x11grab") &&
+        is_x11_window_id(cfg.device_url);
     if (!vsize) {
-        // Query X11 display geometry at runtime.
-        video_size_storage = query_display_geometry_linux(cfg.device_url);
+        // Window-ID capture: the window's own geometry.  Root capture:
+        // the X display geometry.
+        video_size_storage = window_id_mode
+            ? query_window_geometry_linux(cfg.device_url)
+            : query_display_geometry_linux(cfg.device_url);
         vsize = video_size_storage.c_str();
     }
 #endif
@@ -4429,9 +4472,11 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
     // Format: ":display.screen+x_offset,y_offset"
     std::string url_with_offset;
 #if defined(__linux__)
-    if (std::string(cfg.input_format) == "x11grab" && !strchr(cfg.device_url, '+')) {
+    if (std::string(cfg.input_format) == "x11grab" &&
+        !is_x11_window_id(cfg.device_url) && !strchr(cfg.device_url, '+')) {
         url_with_offset = std::string(cfg.device_url) + "+0,0";
-        // "+0,0" appends the top-left capture origin.
+        // "+0,0" appends the top-left capture origin (root capture only —
+        // a window-ID URL must reach x11grab verbatim).
     }
 #endif
     const char* open_url = url_with_offset.empty() ? cfg.device_url
@@ -4450,7 +4495,11 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
         if (std::string(cfg.input_format) == "kmsgrab")
             std::cerr << "    Hint: add yourself to the 'video' group or run with sudo.\n";
         if (std::string(cfg.input_format) == "x11grab")
-            std::cerr << "    Hint: ensure DISPLAY=" << cfg.device_url << " is accessible.\n";
+            std::cerr << "    Hint: ensure DISPLAY=" << (is_x11_window_id(cfg.device_url) ? "$DISPLAY" : cfg.device_url)
+                      << " is accessible."
+                      << (is_x11_window_id(cfg.device_url)
+                          ? " Get a window ID with: xwininfo -root -tree" : "")
+                      << "\n";
 #elif defined(__APPLE__)
         std::cerr << "    Hint: grant Screen Recording permission in System Settings → Privacy.\n";
 #endif

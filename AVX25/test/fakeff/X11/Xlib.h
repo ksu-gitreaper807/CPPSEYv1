@@ -17,6 +17,18 @@ typedef unsigned long Atom;
 #define None    0L
 #define AnyPropertyType 0L
 
+typedef int Status;
+typedef struct { int dummy; } Visual;
+typedef struct {
+    int x, y, width, height;
+    unsigned int border_width;
+    int depth;
+    Visual *visual;
+    Window root;
+    int win_class;  // 'class' is a C++ keyword — test-stand-in only
+    unsigned long mask;
+} XWindowAttributes;
+
 Display *XOpenDisplay(const char *display);
 void     XCloseDisplay(Display *dpy);
 int      DefaultScreen(Display *dpy);
@@ -27,6 +39,8 @@ int      XDisplayHeight(Display *dpy, int screen);
 void     XFree(void *ptr);
 Atom     XInternAtom(Display *dpy, const char *name, int only_if_exists);
 void     XFlush(Display *dpy);
+Status   XGetWindowAttributes(Display *dpy, Window w, XWindowAttributes *wa);
+void     XStoreName(Display *dpy, Window w, const char *name);
 
 #endif
 }

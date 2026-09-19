@@ -54,11 +54,14 @@ int main(int argc, char **argv)
     unsigned long black = BlackPixel(dpy, scr);
     unsigned long white = WhitePixel(dpy, scr);
 
+    XStoreName(dpy, w, "xflash");
     XMapWindow(dpy, w);
     XRaiseWindow(dpy, w);
     XFlush(dpy);
-    fprintf(stderr, "[xflash] %dx%d  %g Hz  %.0f s — expecting a detector alarm...\n",
-            W, H, hz, duration);
+    fprintf(stderr, "[xflash] %dx%d  %g Hz  %.0f s\n", W, H, hz, duration);
+    fprintf(stderr, "[xflash] window id: 0x%lx\n", (unsigned long)w);
+    fprintf(stderr, "[xflash] capture it with:  ./detector 0x%lx 60\n",
+            (unsigned long)w);
 
     struct timespec ts0, ts;
     clock_gettime(CLOCK_MONOTONIC, &ts0);

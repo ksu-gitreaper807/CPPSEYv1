@@ -384,6 +384,12 @@ int sws_scale(SwsContext *c,
 // X11 — no display available; detector falls back to its safe defaults
 // ============================================================================
 Display *XOpenDisplay(const char *display) { (void)display; return nullptr; }
+Status XGetWindowAttributes(Display *dpy, Window w, XWindowAttributes *wa) {
+    (void)dpy; (void)w; (void)wa; return Failure;
+}
+void XStoreName(Display *dpy, Window w, const char *name) {
+    (void)dpy; (void)w; (void)name;
+}
 void XCloseDisplay(Display *dpy) { (void)dpy; }
 int  DefaultScreen(Display *dpy) { (void)dpy; return 0; }
 Window RootWindow(Display *dpy, int s) { (void)dpy; (void)s; return 0; }
