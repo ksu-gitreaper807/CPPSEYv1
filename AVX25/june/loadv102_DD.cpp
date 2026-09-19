@@ -1875,8 +1875,15 @@ struct FlashRateCounter {
 
     int events_in_window(double pts_now) const {
         int n = 0;
+        // FIX 4c (v103): strict < — the inclusive <= admitted an onset that
+        // sits EXACTLY 1.0 s in the past.  A 2 Hz flash produces onsets at
+        // exactly 0.5 s spacing, so one onset always lands exactly on the
+        // window boundary and was double-admitted -> 3 events/s -> false
+        // alarm.  3 Hz onsets (0.333 s spacing) are all strictly inside the
+        // window, so true positives are unaffected; 2.5 Hz (0.4 s spacing)
+        // still sees only 2 events.
         for (int i = 0; i < count; ++i)
-            if (pts_now - ring[i] <= WINDOW_SECONDS) ++n;
+            if (pts_now - ring[i] < WINDOW_SECONDS - 1e-3) ++n;
         return n;
     }
 
@@ -1988,6 +1995,16 @@ struct PSEConfig {
     double   fps              = 25.0;
     // min_flash_sep removed in v61: replaced by rising-edge onset counting
 
+    // FIX 4b (v103) — flash population direction (cycle onset detection)
+    //
+    // dir_majority_frac: the flash population has a defined direction (RISE or
+    // FALL) only when one direction's hit count exceeds this fraction of the
+    // channel's total directional hits.  At ~0.5 the direction of incoherent
+    // content (white noise, uncorrelated flicker) is a coin flip and jitters
+    // window-to-window, producing spurious FALL→RISE "onsets".  0.55 requires
+    // a clear majority so only coherent flash populations define a direction.
+    float dir_majority_frac  = 0.55f;
+
     // FIX 8: encoded-luma range below which a pixel is considered static and
     // excluded from the flash mask.  Default 16 covers H.264 artifact range
     // at bitrates ≥ 1 Mbit/s while staying below the minimum qualifying swing.
@@ -2022,6 +2039,7 @@ struct PSEConfig16 {
     int16_t  kr_fixed            = 101;
     double   fps                 = 25.0;
     uint8_t  static_luma_thresh  = 16;
+    float    dir_majority_frac   = 0.55f; // FIX 4b (v103)
     double   static_window_seconds   = 2.0;
     float    static_chunk_ema_thresh = 6.0f;
     float    static_nullify_frac     = 0.85f;
@@ -2394,6 +2412,16 @@ struct PSEState {
     SpatialDensityChecker density_y, density_r;
     ScreenProtector       screen;           // dim/blackout display protection
 
+    // FIX 4b (v103) — last valid flash population direction per channel.
+    // -1 = FALL (b2d dominant), +1 = RISE (d2b dominant), 0 = none yet.
+    // Persisted across analysis windows (through mask-free windows) so a
+    // FALL→RISE flip registers exactly one new flash cycle even when the
+    // window never observes both directions simultaneously (the case of a
+    // spatially uniform flash, where every pixel shares the direction of the
+    // first transition in the window and the pixel-level pair gate cannot fire).
+    int prev_dir_y = 0;
+    int prev_dir_r = 0;
+
     // FIX 9 — Long-term static region map
     // One float per Y-plane chunk, storing the exponential moving average of
     // the 8-frame luma range for that chunk.  Updated every analysis window by
@@ -2462,6 +2490,9 @@ struct PSEState16 {
     PSEConfig16           config;
     FlashRateCounter      rate_y, rate_r;
     SpatialDensityChecker density_y, density_r;
+    // FIX 4b (v103) — last valid flash population direction (see PSEState).
+    int prev_dir_y = 0;
+    int prev_dir_r = 0;
     // ScreenProtector is shared with fast detector — only one instance
 
     std::vector<float> static_map_y;
@@ -3189,18 +3220,90 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
         }
     }
 
-    // ── FIX 4 (v61): rising-edge onset recording ─────────────────────────
+    // ── FIX 4b (v103) — flash population direction & cycle onset ──────────
+    //
+    // ROOT CAUSE FIXED (v102 → v103): for a spatially uniform flash
+    // (full-screen, or a co-spatial flashing block), every flashing pixel
+    // records the SAME combo — the direction of the FIRST transition inside
+    // the analysis window.  As the window slides, the whole population
+    // alternates d2b-only / b2d-only, so the pixel-level pair gate
+    // (has_d2b && has_b2d) is never satisfied in the same window: no onsets
+    // are ever recorded and the rate alarm cannot fire for the canonical
+    // PSE stimulus at ANY frequency (baseline: 0 alarms for 1–30 Hz
+    // full-screen flashes at 24–60 fps).
+    //
+    // FIX — onset at signal level (ITU "opposing changes" as a temporal
+    // property): the flash population direction is +1 (RISE) when d2b hits
+    // form a clear majority (dir_majority_frac), −1 (FALL) for b2d, 0 when
+    // incoherent.  A FALL→RISE flip — a new dark→bright cycle starting — is
+    // one flash onset.  A continuous flash produces exactly one such flip
+    // per period, so onsets/second ≈ flash rate, and the existing rate gate
+    // (≥3 onsets in 1 s) again means "≥3 flashes per second".
+    //
+    // Safeguards preserved:
+    //   • spatial criterion (concurrent area / sat-red / local density) unchanged
+    //   • dominant-combo coherence (has_d2b || has_b2d) still required
+    //   • rate threshold + 1 s window unchanged
+    //   • monotonic ramps, single scene cuts and pans never produce a
+    //     FALL→RISE flip (their population direction does not alternate),
+    //     so they remain silent as before
+    auto pop_dir = [&](const uint32_t* d2b_hits, const uint32_t* b2d_hits) -> int {
+        uint32_t t_d2b = 0, t_b2d = 0;
+        for (int i : kValidComboIndices) {
+            t_d2b += d2b_hits[i];
+            t_b2d += b2d_hits[i];
+        }
+        const uint32_t tot = t_d2b + t_b2d;
+        if (tot == 0) return 0;
+        const uint32_t maj = (t_d2b > t_b2d) ? t_d2b : t_b2d;
+        if (static_cast<double>(maj) <
+            static_cast<double>(state.config.dir_majority_frac) *
+            static_cast<double>(tot))
+            return 0;
+        return (t_d2b > t_b2d) ? +1 : -1;
+    };
+
+    const int  dir_y_now = pop_dir(tracker.y_d2b_hits, tracker.y_b2d_hits);
+    const int  dir_r_now = pop_dir(tracker.r_d2b_hits, tracker.r_b2d_hits);
+    // Cycle onset: the new dominant direction is RISE and the previous valid
+    // direction was FALL — i.e. a completed fall→rise = start of a d2b cycle.
+    const bool flip_y = (dir_y_now == +1) && (state.prev_dir_y == -1);
+    const bool flip_r = (dir_r_now == +1) && (state.prev_dir_r == -1);
+    state.prev_dir_y = (dir_y_now != 0) ? dir_y_now : state.prev_dir_y;
+    state.prev_dir_r = (dir_r_now != 0) ? dir_r_now : state.prev_dir_r;
+
+    // ── FIX 4 (v61) + FIX 4b (v103): rising-edge onset recording ──────────
     //   • spatial criterion met (concurrent area, sat-red, or local density)
-    //   • opposing-pair present (both d2b AND b2d detected in the 8-frame window)
+    //   • opposing-pair present: pixel-level (both d2b AND b2d combos —
+    //     anti-phase / checkerboard content) OR cycle-level (FALL→RISE
+    //     population flip — uniform / co-spatial flashes)
     // record_state() records an onset timestamp on the false→true edge and
     // resets state on the true→false edge — no min_sep parameter needed.
-    const bool is_flashing_y = spatial_flash && has_d2b_y && has_b2d_y;
-    const bool is_flashing_r = spatial_flash && has_d2b_r && has_b2d_r;
+    const bool is_flashing_y = spatial_flash &&
+        ((has_d2b_y && has_b2d_y) || (flip_y && (has_d2b_y || has_b2d_y)));
+    const bool is_flashing_r = spatial_flash &&
+        ((has_d2b_r && has_b2d_r) || (flip_r && (has_d2b_r || has_b2d_r)));
     state.rate_y.record_state(is_flashing_y, pts_newest);
     state.rate_r.record_state(is_flashing_r, pts_newest);
 
+
     const bool pse_y = state.rate_y.pse_rate_exceeded(pts_newest);
     const bool pse_r = state.rate_r.pse_rate_exceeded(pts_newest);
+
+    // FIX 4c (v103): frequency gate.  Onset COUNT in a 1 s window cannot
+    // separate 2.5 Hz (onsets at Δ=0/0.4/0.8 → 3 events in the window)
+    // from 3 Hz (Δ=0/0.333/0.667 → also 3 events).  Require the
+    // inter-onset frequency of the last two recorded onsets to be
+    // ≥ ~3 Hz (2.95 for float tolerance at exactly 3.000 Hz).
+    //   2.0 Hz → hz_est 2.0 → rejected   2.5 Hz → 2.5 → rejected
+    //   3.0 Hz → 3.0000 ≥ 2.95 → accepted   4 Hz+ → accepted
+    auto onset_hz_of = [](const FlashRateCounter& c) -> double {
+        const auto [oa, ob] = c.last_two_onsets();
+        return (oa >= 0.0 && ob > oa) ? 1.0 / (ob - oa) : -1.0;
+    };
+    static constexpr double PSE_MIN_ALARM_HZ = 2.95;
+    const bool y_gate = (pse_y && onset_hz_of(state.rate_y) >= PSE_MIN_ALARM_HZ);
+    const bool r_gate = (pse_r && onset_hz_of(state.rate_r) >= PSE_MIN_ALARM_HZ);
 
     // ── Output ────────────────────────────────────────────────────────────
     // All variables needed by pse_flash_probability are fully resolved here:
@@ -3300,12 +3403,18 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
             const double lag_ms = (is_flashing_y && state.diag.spatial_start_pts >= 0)
                 ? (pts_newest - state.diag.spatial_start_pts) * 1000.0 : -1.0;
 
+            // FIX 4b: population direction (RISE/FALL/-) and cycle-flip
+            // (Y/N) — the onset path used for uniform flashes.
+            const char* dir_y_str = (dir_y_now > 0) ? "RISE"
+                                    : (dir_y_now < 0) ? "FALL" : "-";
             std::cout << std::fixed << std::setprecision(1)
                       << "[D] win=" << win_span_ms << "ms"
                       << "  step=" << (step_ms >= 0 ? step_ms : 0.0) << "ms"
                       << "  sep=" << peak_sep_val << "/" << max_sep_val
                       << "  gate_min=" << min_hz_gate << "Hz"
                       << "  pair=" << pair_status
+                      << "  diry=" << dir_y_str
+                      << "  flipy=" << (flip_y ? "Y" : "N")
                       << "  is_flash_y=" << (is_flashing_y ? "Y" : "N")
                       << "  hz_est=" << (hz_est > 0 ? hz_est : 0.0) << "Hz"
                       << "  lag=" << lag_ms << "ms"
@@ -3350,7 +3459,7 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     // pathway drove the alarm and what the probability was at alarm time.
     // This allows post-hoc analysis to distinguish near-miss alarms (P≈70%)
     // from confirmed severe events (P≈95%).
-    if ((pse_y || pse_r) && spatial_flash) {
+    if ((y_gate || r_gate) && spatial_flash) {
         // Re-compute prob at alarm time (same call, cost is negligible).
         const auto alarm_prob = pse_flash_probability(
             max_concurrent_y * 100.f,
@@ -3996,13 +4105,59 @@ void process_pse_temporal_avx_threaded_16slot(
         }
     }
 
-    const bool is_flashing_y = spatial_flash && has_d2b_y && has_b2d_y;
-    const bool is_flashing_r = spatial_flash && has_d2b_r && has_b2d_r;
+    // FIX 4b (v103) — flash population direction & cycle onset.
+    // Same root cause and rationale as the 8-slot version (see there):
+    // a spatially uniform flash can never satisfy the pixel-level pair gate,
+    // so onsets are derived from a FALL→RISE flip of the population
+    // direction, which yields exactly one onset per flash cycle.
+    auto pop_dir16 = [&](const uint32_t* d2b_hits, const uint32_t* b2d_hits) -> int {
+        uint32_t t_d2b = 0, t_b2d = 0;
+        for (int i : kValidComboIndices_16) {
+            t_d2b += d2b_hits[i];
+            t_b2d += b2d_hits[i];
+        }
+        const uint32_t tot = t_d2b + t_b2d;
+        if (tot == 0) return 0;
+        const uint32_t maj = (t_d2b > t_b2d) ? t_d2b : t_b2d;
+        if (static_cast<double>(maj) <
+            static_cast<double>(state.config.dir_majority_frac) *
+            static_cast<double>(tot))
+            return 0;
+        return (t_d2b > t_b2d) ? +1 : -1;
+    };
+
+    const int  dir_y_now = pop_dir16(tracker.y_d2b_hits, tracker.y_b2d_hits);
+    const int  dir_r_now = pop_dir16(tracker.r_d2b_hits, tracker.r_b2d_hits);
+    const bool flip_y = (dir_y_now == +1) && (state.prev_dir_y == -1);
+    const bool flip_r = (dir_r_now == +1) && (state.prev_dir_r == -1);
+    state.prev_dir_y = (dir_y_now != 0) ? dir_y_now : state.prev_dir_y;
+    state.prev_dir_r = (dir_r_now != 0) ? dir_r_now : state.prev_dir_r;
+
+    const bool is_flashing_y = spatial_flash &&
+        ((has_d2b_y && has_b2d_y) || (flip_y && (has_d2b_y || has_b2d_y)));
+    const bool is_flashing_r = spatial_flash &&
+        ((has_d2b_r && has_b2d_r) || (flip_r && (has_d2b_r || has_b2d_r)));
     state.rate_y.record_state(is_flashing_y, pts_newest);
     state.rate_r.record_state(is_flashing_r, pts_newest);
 
+
     const bool pse_y = state.rate_y.pse_rate_exceeded(pts_newest);
     const bool pse_r = state.rate_r.pse_rate_exceeded(pts_newest);
+
+    // FIX 4c (v103): frequency gate.  Onset COUNT in a 1 s window cannot
+    // separate 2.5 Hz (onsets at Δ=0/0.4/0.8 → 3 events in the window)
+    // from 3 Hz (Δ=0/0.333/0.667 → also 3 events).  Require the
+    // inter-onset frequency of the last two recorded onsets to be
+    // ≥ ~3 Hz (2.95 for float tolerance at exactly 3.000 Hz).
+    //   2.0 Hz → hz_est 2.0 → rejected   2.5 Hz → 2.5 → rejected
+    //   3.0 Hz → 3.0000 ≥ 2.95 → accepted   4 Hz+ → accepted
+    auto onset_hz_of = [](const FlashRateCounter& c) -> double {
+        const auto [oa, ob] = c.last_two_onsets();
+        return (oa >= 0.0 && ob > oa) ? 1.0 / (ob - oa) : -1.0;
+    };
+    static constexpr double PSE_MIN_ALARM_HZ = 2.95;
+    const bool y_gate = (pse_y && onset_hz_of(state.rate_y) >= PSE_MIN_ALARM_HZ);
+    const bool r_gate = (pse_r && onset_hz_of(state.rate_r) >= PSE_MIN_ALARM_HZ);
 
     // Diagnostic output (prefixed [S] = slow detector)
     if (total_flash_y > 0 || flash_r > 0 || sat_pixels_r > 0) {
@@ -4020,17 +4175,22 @@ void process_pse_temporal_avx_threaded_16slot(
         const auto [oa, ob] = state.rate_y.last_two_onsets();
         const double hz_est = (oa >= 0 && ob > oa) ? 1.0 / (ob - oa) : -1.0;
 
+        // FIX 4b: population direction (RISE/FALL/-) and cycle-flip (Y/N).
+        const char* dir_y_str16 = (dir_y_now > 0) ? "RISE"
+                                : (dir_y_now < 0) ? "FALL" : "-";
         std::cout << std::fixed << std::setprecision(1)
                   << "[S] win=" << ((pts_newest - t0) * 1000.0) << "ms"
                   << "  sep=" << peak_sep_val << "/" << max_sep_val
                   << "  gate_min=" << min_hz_gate << "Hz"
                   << "  pair=" << pair_status
+                  << "  diry=" << dir_y_str16
+                  << "  flipy=" << (flip_y ? "Y" : "N")
                   << "  is_flash_y=" << (is_flashing_y ? "Y" : "N")
                   << "  hz_est=" << (hz_est > 0 ? hz_est : 0.0) << "Hz"
                   << "\n" << std::defaultfloat;
     }
 
-    if ((pse_y || pse_r) && spatial_flash) {
+    if ((y_gate || r_gate) && spatial_flash) {
         std::cout << "\n[!!!][SLOW] PSE 3Hz FLASH ALARM  t=" << pts_newest << "s"
                   << "  Y onsets/s: " << state.rate_y.events_in_window(pts_newest)
                   << "  R onsets/s: " << state.rate_r.events_in_window(pts_newest)
