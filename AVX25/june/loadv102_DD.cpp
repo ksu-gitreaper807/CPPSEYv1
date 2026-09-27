@@ -1049,6 +1049,11 @@ static bool query_display_profile_macos(DisplayProfile* out)
 #include <dirent.h>    // opendir / readdir for sysfs iteration
 #include <fcntl.h>     // open
 #include <unistd.h>    // read / close
+#include <cstdlib>     // std::system (ffmpeg lookup)
+#include <cctype>      // isdigit (portal probe parsing)
+#include <poll.h>      // poll (probe timeout)
+#include <sys/stat.h>  // mkfifo / S_I*
+#include <sys/wait.h>  // waitpid (ffmpeg coprocess)
 #include <cstring>     // strncmp / snprintf
 
 // Parse the EDID RandR property blob to extract max luminance and
@@ -1875,8 +1880,15 @@ struct FlashRateCounter {
 
     int events_in_window(double pts_now) const {
         int n = 0;
+        // FIX 4c (v103): strict < — the inclusive <= admitted an onset that
+        // sits EXACTLY 1.0 s in the past.  A 2 Hz flash produces onsets at
+        // exactly 0.5 s spacing, so one onset always lands exactly on the
+        // window boundary and was double-admitted -> 3 events/s -> false
+        // alarm.  3 Hz onsets (0.333 s spacing) are all strictly inside the
+        // window, so true positives are unaffected; 2.5 Hz (0.4 s spacing)
+        // still sees only 2 events.
         for (int i = 0; i < count; ++i)
-            if (pts_now - ring[i] <= WINDOW_SECONDS) ++n;
+            if (pts_now - ring[i] < WINDOW_SECONDS - 1e-3) ++n;
         return n;
     }
 
@@ -1988,6 +2000,16 @@ struct PSEConfig {
     double   fps              = 25.0;
     // min_flash_sep removed in v61: replaced by rising-edge onset counting
 
+    // FIX 4b (v103) — flash population direction (cycle onset detection)
+    //
+    // dir_majority_frac: the flash population has a defined direction (RISE or
+    // FALL) only when one direction's hit count exceeds this fraction of the
+    // channel's total directional hits.  At ~0.5 the direction of incoherent
+    // content (white noise, uncorrelated flicker) is a coin flip and jitters
+    // window-to-window, producing spurious FALL→RISE "onsets".  0.55 requires
+    // a clear majority so only coherent flash populations define a direction.
+    float dir_majority_frac  = 0.55f;
+
     // FIX 8: encoded-luma range below which a pixel is considered static and
     // excluded from the flash mask.  Default 16 covers H.264 artifact range
     // at bitrates ≥ 1 Mbit/s while staying below the minimum qualifying swing.
@@ -2022,6 +2044,7 @@ struct PSEConfig16 {
     int16_t  kr_fixed            = 101;
     double   fps                 = 25.0;
     uint8_t  static_luma_thresh  = 16;
+    float    dir_majority_frac   = 0.55f; // FIX 4b (v103)
     double   static_window_seconds   = 2.0;
     float    static_chunk_ema_thresh = 6.0f;
     float    static_nullify_frac     = 0.85f;
@@ -2394,6 +2417,16 @@ struct PSEState {
     SpatialDensityChecker density_y, density_r;
     ScreenProtector       screen;           // dim/blackout display protection
 
+    // FIX 4b (v103) — last valid flash population direction per channel.
+    // -1 = FALL (b2d dominant), +1 = RISE (d2b dominant), 0 = none yet.
+    // Persisted across analysis windows (through mask-free windows) so a
+    // FALL→RISE flip registers exactly one new flash cycle even when the
+    // window never observes both directions simultaneously (the case of a
+    // spatially uniform flash, where every pixel shares the direction of the
+    // first transition in the window and the pixel-level pair gate cannot fire).
+    int prev_dir_y = 0;
+    int prev_dir_r = 0;
+
     // FIX 9 — Long-term static region map
     // One float per Y-plane chunk, storing the exponential moving average of
     // the 8-frame luma range for that chunk.  Updated every analysis window by
@@ -2462,6 +2495,9 @@ struct PSEState16 {
     PSEConfig16           config;
     FlashRateCounter      rate_y, rate_r;
     SpatialDensityChecker density_y, density_r;
+    // FIX 4b (v103) — last valid flash population direction (see PSEState).
+    int prev_dir_y = 0;
+    int prev_dir_r = 0;
     // ScreenProtector is shared with fast detector — only one instance
 
     std::vector<float> static_map_y;
@@ -3189,18 +3225,90 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
         }
     }
 
-    // ── FIX 4 (v61): rising-edge onset recording ─────────────────────────
+    // ── FIX 4b (v103) — flash population direction & cycle onset ──────────
+    //
+    // ROOT CAUSE FIXED (v102 → v103): for a spatially uniform flash
+    // (full-screen, or a co-spatial flashing block), every flashing pixel
+    // records the SAME combo — the direction of the FIRST transition inside
+    // the analysis window.  As the window slides, the whole population
+    // alternates d2b-only / b2d-only, so the pixel-level pair gate
+    // (has_d2b && has_b2d) is never satisfied in the same window: no onsets
+    // are ever recorded and the rate alarm cannot fire for the canonical
+    // PSE stimulus at ANY frequency (baseline: 0 alarms for 1–30 Hz
+    // full-screen flashes at 24–60 fps).
+    //
+    // FIX — onset at signal level (ITU "opposing changes" as a temporal
+    // property): the flash population direction is +1 (RISE) when d2b hits
+    // form a clear majority (dir_majority_frac), −1 (FALL) for b2d, 0 when
+    // incoherent.  A FALL→RISE flip — a new dark→bright cycle starting — is
+    // one flash onset.  A continuous flash produces exactly one such flip
+    // per period, so onsets/second ≈ flash rate, and the existing rate gate
+    // (≥3 onsets in 1 s) again means "≥3 flashes per second".
+    //
+    // Safeguards preserved:
+    //   • spatial criterion (concurrent area / sat-red / local density) unchanged
+    //   • dominant-combo coherence (has_d2b || has_b2d) still required
+    //   • rate threshold + 1 s window unchanged
+    //   • monotonic ramps, single scene cuts and pans never produce a
+    //     FALL→RISE flip (their population direction does not alternate),
+    //     so they remain silent as before
+    auto pop_dir = [&](const uint32_t* d2b_hits, const uint32_t* b2d_hits) -> int {
+        uint32_t t_d2b = 0, t_b2d = 0;
+        for (int i : kValidComboIndices) {
+            t_d2b += d2b_hits[i];
+            t_b2d += b2d_hits[i];
+        }
+        const uint32_t tot = t_d2b + t_b2d;
+        if (tot == 0) return 0;
+        const uint32_t maj = (t_d2b > t_b2d) ? t_d2b : t_b2d;
+        if (static_cast<double>(maj) <
+            static_cast<double>(state.config.dir_majority_frac) *
+            static_cast<double>(tot))
+            return 0;
+        return (t_d2b > t_b2d) ? +1 : -1;
+    };
+
+    const int  dir_y_now = pop_dir(tracker.y_d2b_hits, tracker.y_b2d_hits);
+    const int  dir_r_now = pop_dir(tracker.r_d2b_hits, tracker.r_b2d_hits);
+    // Cycle onset: the new dominant direction is RISE and the previous valid
+    // direction was FALL — i.e. a completed fall→rise = start of a d2b cycle.
+    const bool flip_y = (dir_y_now == +1) && (state.prev_dir_y == -1);
+    const bool flip_r = (dir_r_now == +1) && (state.prev_dir_r == -1);
+    state.prev_dir_y = (dir_y_now != 0) ? dir_y_now : state.prev_dir_y;
+    state.prev_dir_r = (dir_r_now != 0) ? dir_r_now : state.prev_dir_r;
+
+    // ── FIX 4 (v61) + FIX 4b (v103): rising-edge onset recording ──────────
     //   • spatial criterion met (concurrent area, sat-red, or local density)
-    //   • opposing-pair present (both d2b AND b2d detected in the 8-frame window)
+    //   • opposing-pair present: pixel-level (both d2b AND b2d combos —
+    //     anti-phase / checkerboard content) OR cycle-level (FALL→RISE
+    //     population flip — uniform / co-spatial flashes)
     // record_state() records an onset timestamp on the false→true edge and
     // resets state on the true→false edge — no min_sep parameter needed.
-    const bool is_flashing_y = spatial_flash && has_d2b_y && has_b2d_y;
-    const bool is_flashing_r = spatial_flash && has_d2b_r && has_b2d_r;
+    const bool is_flashing_y = spatial_flash &&
+        ((has_d2b_y && has_b2d_y) || (flip_y && (has_d2b_y || has_b2d_y)));
+    const bool is_flashing_r = spatial_flash &&
+        ((has_d2b_r && has_b2d_r) || (flip_r && (has_d2b_r || has_b2d_r)));
     state.rate_y.record_state(is_flashing_y, pts_newest);
     state.rate_r.record_state(is_flashing_r, pts_newest);
 
+
     const bool pse_y = state.rate_y.pse_rate_exceeded(pts_newest);
     const bool pse_r = state.rate_r.pse_rate_exceeded(pts_newest);
+
+    // FIX 4c (v103): frequency gate.  Onset COUNT in a 1 s window cannot
+    // separate 2.5 Hz (onsets at Δ=0/0.4/0.8 → 3 events in the window)
+    // from 3 Hz (Δ=0/0.333/0.667 → also 3 events).  Require the
+    // inter-onset frequency of the last two recorded onsets to be
+    // ≥ ~3 Hz (2.95 for float tolerance at exactly 3.000 Hz).
+    //   2.0 Hz → hz_est 2.0 → rejected   2.5 Hz → 2.5 → rejected
+    //   3.0 Hz → 3.0000 ≥ 2.95 → accepted   4 Hz+ → accepted
+    auto onset_hz_of = [](const FlashRateCounter& c) -> double {
+        const auto [oa, ob] = c.last_two_onsets();
+        return (oa >= 0.0 && ob > oa) ? 1.0 / (ob - oa) : -1.0;
+    };
+    static constexpr double PSE_MIN_ALARM_HZ = 2.95;
+    const bool y_gate = (pse_y && onset_hz_of(state.rate_y) >= PSE_MIN_ALARM_HZ);
+    const bool r_gate = (pse_r && onset_hz_of(state.rate_r) >= PSE_MIN_ALARM_HZ);
 
     // ── Output ────────────────────────────────────────────────────────────
     // All variables needed by pse_flash_probability are fully resolved here:
@@ -3300,12 +3408,18 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
             const double lag_ms = (is_flashing_y && state.diag.spatial_start_pts >= 0)
                 ? (pts_newest - state.diag.spatial_start_pts) * 1000.0 : -1.0;
 
+            // FIX 4b: population direction (RISE/FALL/-) and cycle-flip
+            // (Y/N) — the onset path used for uniform flashes.
+            const char* dir_y_str = (dir_y_now > 0) ? "RISE"
+                                    : (dir_y_now < 0) ? "FALL" : "-";
             std::cout << std::fixed << std::setprecision(1)
                       << "[D] win=" << win_span_ms << "ms"
                       << "  step=" << (step_ms >= 0 ? step_ms : 0.0) << "ms"
                       << "  sep=" << peak_sep_val << "/" << max_sep_val
                       << "  gate_min=" << min_hz_gate << "Hz"
                       << "  pair=" << pair_status
+                      << "  diry=" << dir_y_str
+                      << "  flipy=" << (flip_y ? "Y" : "N")
                       << "  is_flash_y=" << (is_flashing_y ? "Y" : "N")
                       << "  hz_est=" << (hz_est > 0 ? hz_est : 0.0) << "Hz"
                       << "  lag=" << lag_ms << "ms"
@@ -3350,7 +3464,7 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     // pathway drove the alarm and what the probability was at alarm time.
     // This allows post-hoc analysis to distinguish near-miss alarms (P≈70%)
     // from confirmed severe events (P≈95%).
-    if ((pse_y || pse_r) && spatial_flash) {
+    if ((y_gate || r_gate) && spatial_flash) {
         // Re-compute prob at alarm time (same call, cost is negligible).
         const auto alarm_prob = pse_flash_probability(
             max_concurrent_y * 100.f,
@@ -3996,13 +4110,59 @@ void process_pse_temporal_avx_threaded_16slot(
         }
     }
 
-    const bool is_flashing_y = spatial_flash && has_d2b_y && has_b2d_y;
-    const bool is_flashing_r = spatial_flash && has_d2b_r && has_b2d_r;
+    // FIX 4b (v103) — flash population direction & cycle onset.
+    // Same root cause and rationale as the 8-slot version (see there):
+    // a spatially uniform flash can never satisfy the pixel-level pair gate,
+    // so onsets are derived from a FALL→RISE flip of the population
+    // direction, which yields exactly one onset per flash cycle.
+    auto pop_dir16 = [&](const uint32_t* d2b_hits, const uint32_t* b2d_hits) -> int {
+        uint32_t t_d2b = 0, t_b2d = 0;
+        for (int i : kValidComboIndices_16) {
+            t_d2b += d2b_hits[i];
+            t_b2d += b2d_hits[i];
+        }
+        const uint32_t tot = t_d2b + t_b2d;
+        if (tot == 0) return 0;
+        const uint32_t maj = (t_d2b > t_b2d) ? t_d2b : t_b2d;
+        if (static_cast<double>(maj) <
+            static_cast<double>(state.config.dir_majority_frac) *
+            static_cast<double>(tot))
+            return 0;
+        return (t_d2b > t_b2d) ? +1 : -1;
+    };
+
+    const int  dir_y_now = pop_dir16(tracker.y_d2b_hits, tracker.y_b2d_hits);
+    const int  dir_r_now = pop_dir16(tracker.r_d2b_hits, tracker.r_b2d_hits);
+    const bool flip_y = (dir_y_now == +1) && (state.prev_dir_y == -1);
+    const bool flip_r = (dir_r_now == +1) && (state.prev_dir_r == -1);
+    state.prev_dir_y = (dir_y_now != 0) ? dir_y_now : state.prev_dir_y;
+    state.prev_dir_r = (dir_r_now != 0) ? dir_r_now : state.prev_dir_r;
+
+    const bool is_flashing_y = spatial_flash &&
+        ((has_d2b_y && has_b2d_y) || (flip_y && (has_d2b_y || has_b2d_y)));
+    const bool is_flashing_r = spatial_flash &&
+        ((has_d2b_r && has_b2d_r) || (flip_r && (has_d2b_r || has_b2d_r)));
     state.rate_y.record_state(is_flashing_y, pts_newest);
     state.rate_r.record_state(is_flashing_r, pts_newest);
 
+
     const bool pse_y = state.rate_y.pse_rate_exceeded(pts_newest);
     const bool pse_r = state.rate_r.pse_rate_exceeded(pts_newest);
+
+    // FIX 4c (v103): frequency gate.  Onset COUNT in a 1 s window cannot
+    // separate 2.5 Hz (onsets at Δ=0/0.4/0.8 → 3 events in the window)
+    // from 3 Hz (Δ=0/0.333/0.667 → also 3 events).  Require the
+    // inter-onset frequency of the last two recorded onsets to be
+    // ≥ ~3 Hz (2.95 for float tolerance at exactly 3.000 Hz).
+    //   2.0 Hz → hz_est 2.0 → rejected   2.5 Hz → 2.5 → rejected
+    //   3.0 Hz → 3.0000 ≥ 2.95 → accepted   4 Hz+ → accepted
+    auto onset_hz_of = [](const FlashRateCounter& c) -> double {
+        const auto [oa, ob] = c.last_two_onsets();
+        return (oa >= 0.0 && ob > oa) ? 1.0 / (ob - oa) : -1.0;
+    };
+    static constexpr double PSE_MIN_ALARM_HZ = 2.95;
+    const bool y_gate = (pse_y && onset_hz_of(state.rate_y) >= PSE_MIN_ALARM_HZ);
+    const bool r_gate = (pse_r && onset_hz_of(state.rate_r) >= PSE_MIN_ALARM_HZ);
 
     // Diagnostic output (prefixed [S] = slow detector)
     if (total_flash_y > 0 || flash_r > 0 || sat_pixels_r > 0) {
@@ -4020,17 +4180,22 @@ void process_pse_temporal_avx_threaded_16slot(
         const auto [oa, ob] = state.rate_y.last_two_onsets();
         const double hz_est = (oa >= 0 && ob > oa) ? 1.0 / (ob - oa) : -1.0;
 
+        // FIX 4b: population direction (RISE/FALL/-) and cycle-flip (Y/N).
+        const char* dir_y_str16 = (dir_y_now > 0) ? "RISE"
+                                : (dir_y_now < 0) ? "FALL" : "-";
         std::cout << std::fixed << std::setprecision(1)
                   << "[S] win=" << ((pts_newest - t0) * 1000.0) << "ms"
                   << "  sep=" << peak_sep_val << "/" << max_sep_val
                   << "  gate_min=" << min_hz_gate << "Hz"
                   << "  pair=" << pair_status
+                  << "  diry=" << dir_y_str16
+                  << "  flipy=" << (flip_y ? "Y" : "N")
                   << "  is_flash_y=" << (is_flashing_y ? "Y" : "N")
                   << "  hz_est=" << (hz_est > 0 ? hz_est : 0.0) << "Hz"
                   << "\n" << std::defaultfloat;
     }
 
-    if ((pse_y || pse_r) && spatial_flash) {
+    if ((y_gate || r_gate) && spatial_flash) {
         std::cout << "\n[!!!][SLOW] PSE 3Hz FLASH ALARM  t=" << pts_newest << "s"
                   << "  Y onsets/s: " << state.rate_y.events_in_window(pts_newest)
                   << "  R onsets/s: " << state.rate_r.events_in_window(pts_newest)
@@ -4124,6 +4289,15 @@ static DownsampleConfig make_downsample_config(int native_w, int native_h)
 //
 // The device_url and framerate can be overridden at runtime via argv[1]/argv[2].
 // ─────────────────────────────────────────────────────────────────────────────
+// True when the device URL is an X11 window ID (e.g. "0x05600007") rather
+// than a display name (":0.0").  Window-ID URLs go to x11grab verbatim.
+static bool is_x11_window_id(const char* url) {
+    if (!url || !*url) return false;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(url, &end, 0);
+    return (end != url) && (*end == '\0') && (v != 0);
+}
+
 static CaptureConfig make_capture_config(int argc, char* argv[])
 {
     CaptureConfig cfg;
@@ -4149,10 +4323,22 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
     // Fall back to x11grab when DISPLAY is set (X11 desktop).
     const char* has_display  = std::getenv("DISPLAY");
     const char* has_wayland  = std::getenv("WAYLAND_DISPLAY");
-    if (has_wayland && !has_display) {
-        // Wayland without X11: use kmsgrab (needs video group / CAP_SYS_ADMIN).
-        // PipeWire / xdg-desktop-portal is the recommended long-term path but
-        // requires D-Bus integration beyond the scope of this C++ file.
+    const char* force        = std::getenv("PSE_CAPTURE");  // wayland|x11|kms
+
+    if (has_wayland && (!force || std::string(force) == "wayland")) {
+        // Wayland session → xdg-desktop-portal + PipeWire (default).
+        // On Plasma Wayland the X11 root window is an EMPTY background
+        // surface even though XWayland sets DISPLAY, so x11grab would
+        // see nothing; the portal captures the compositor's real output.
+        cfg.input_format = "wayland_pipewire";
+        cfg.device_url   = "type=screen";
+        cfg.framerate    = "60";
+        cfg.video_size   = nullptr;        // probed at runtime (portal)
+        cfg.pixel_format = nullptr;
+        cfg.needs_swscale = true;          // PipeWire BGRA → BGR0 pipeline
+    } else if (!has_display && force && std::string(force) == "kms") {
+        // Bare-metal Wayland without the portal: kmsgrab (video group /
+        // CAP_SYS_ADMIN).
         cfg.input_format = "kmsgrab";
         cfg.device_url   = "";             // primary KMS plane
         cfg.framerate    = "60";
@@ -4160,7 +4346,7 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
         cfg.pixel_format = "bgr0";
         cfg.needs_swscale = true;
     } else {
-        // X11 (or XWayland) session.
+        // X11 (or forced X11/XWayland) session.
         cfg.input_format = "x11grab";
         cfg.device_url   = has_display ? has_display : ":0.0";
         cfg.framerate    = "60";
@@ -4171,8 +4357,17 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
 #endif
 
     // Allow argv[1] = device override, argv[2] = framerate override.
-    if (argc > 1 && argv[1][0] != '\0') cfg.device_url = argv[1];
-    if (argc > 2 && argv[2][0] != '\0') cfg.framerate  = argv[2];
+    // The URL selects the backend: "wayland[:...]" → portal capture,
+    // ":N[.S][+x,y]" or an X11 window ID → x11grab.
+    if (argc > 1 && argv[1][0] != '\0') {
+        cfg.device_url = argv[1];
+        const std::string u = argv[1];
+        if (u == "wayland" || u.rfind("wayland:", 0) == 0)
+            cfg.input_format = "wayland_pipewire";
+        else if (u[0] == ':' || is_x11_window_id(u.c_str()))
+            cfg.input_format = "x11grab";
+    }
+    if (argc > 2 && argv[2][0] != '\0') cfg.framerate = argv[2];
 
     return cfg;
 }
@@ -4196,7 +4391,277 @@ static std::string query_display_geometry_linux(const char* display_env)
     XCloseDisplay(dpy);
     return std::to_string(w) + "x" + std::to_string(h);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// X11 window-ID capture (rootless XWayland support)
+//
+// On rootless XWayland (modern KDE Plasma Wayland, Xwayland -rootless) the
+// X11 ROOT window is only the background surface — X11 client windows are
+// mapped as individual Wayland surfaces and are NEVER visible to root grabs.
+// x11grab ":0" then sees wallpaper only, no matter what the user watches.
+// x11grab can instead capture a specific window by its X11 window ID, so
+// the detector accepts a window ID as the device URL:
+//     ./detector 0x05600007 60
+// ─────────────────────────────────────────────────────────────────────────────
+// Window geometry for the video_size option (a window ID is not an openable
+// display, so query_display_geometry_linux cannot be used in window mode).
+static std::string query_window_geometry_linux(const char* window_id_str)
+{
+    char* end = nullptr;
+    const unsigned long wid = std::strtoul(window_id_str, &end, 0);
+    Display* dpy = XOpenDisplay(nullptr);   // $DISPLAY
+    if (!dpy || wid == 0) {
+        if (dpy) XCloseDisplay(dpy);
+        return "1920x1080";
+    }
+    XWindowAttributes wa;
+    std::string s = "1920x1080";
+    if (XGetWindowAttributes(dpy, (Window)wid, &wa) == Success)
+        s = std::to_string(wa.width) + "x" + std::to_string(wa.height);
+    XCloseDisplay(dpy);
+    return s;
+}
 #endif
+
+// ============================================================================
+// Wayland capture — xdg-desktop-portal + PipeWire (Linux)
+//
+// On a Wayland session (e.g. KDE Plasma Wayland with rootless XWayland)
+// x11grab can only see the X11 ROOT window, which is just an empty
+// background surface — the real screen is composed by the Wayland
+// compositor and never touches X.  The standard Wayland capture path is
+// xdg-desktop-portal (RemoteDesktop), which delivers frames through
+// PipeWire.  FFmpeg's 'pipewire' input device implements exactly that
+// portal handshake, so this front end shells out:
+//
+//   probe : ffmpeg -f pipewire -i "type=screen" -frames:v 1 -f null -
+//           (triggers the screen-share permission prompt; parses WxH)
+//   live  : ffmpeg -f pipewire -i "type=screen" -f rawvideo -pix_fmt bgra -
+//           (stdout → FIFO → FFmpeg rawvideo demuxer → existing pipeline)
+//
+// The downstream pipeline is unchanged: PipeWire frames are 4-byte
+// B,G,R,α pixels — the same B,G,R bytes the BGR0→YUV420p converter
+// consumes (the 4th byte is ignored).
+// ============================================================================
+#if defined(__linux__)
+struct WaylandCapture {
+    pid_t       child_pid = -1;   // live ffmpeg coprocess
+    int         rwfd      = -1;   // O_RDWR anchor on the FIFO
+    std::string fifo_dir;
+    std::string fifo_path;
+    bool        active  = false;
+};
+
+static void wayland_capture_cleanup(WaylandCapture* wc) {
+    if (!wc || !wc->active) return;
+    if (wc->child_pid > 0) {
+        kill(wc->child_pid, SIGTERM);
+        int st = 0;
+        for (int i = 0; i < 100; ++i) {
+            if (waitpid(wc->child_pid, &st, WNOHANG) != 0) break;
+            usleep(20 * 1000);
+        }
+        waitpid(wc->child_pid, &st, 0);   // reap if it lingered
+        wc->child_pid = -1;
+    }
+    if (wc->rwfd >= 0) { close(wc->rwfd); wc->rwfd = -1; }
+    if (!wc->fifo_path.empty()) unlink(wc->fifo_path.c_str());
+    if (!wc->fifo_dir.empty())  rmdir(wc->fifo_dir.c_str());
+    wc->fifo_path.clear();
+    wc->fifo_dir.clear();
+    wc->active = false;
+}
+
+// Run a single-frame PipeWire/portal capture and parse the screen "WxH"
+// from ffmpeg's stream info.  The portal's screen-share prompt appears
+// during this call; blocks up to timeout_s waiting for the user to approve.
+static bool wayland_portal_probe(const std::string& type_spec,
+                                 std::string& size_out, int timeout_s,
+                                 std::string& err_out) {
+    int cpipe[2];
+    if (pipe(cpipe) != 0) { err_out = "pipe() failed"; return false; }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(cpipe[0]); close(cpipe[1]);
+        err_out = "fork() failed"; return false;
+    }
+    if (pid == 0) {
+        // Child: stderr → pipe, then exec (no C++ runtime past this point).
+        dup2(cpipe[1], 2);
+        close(cpipe[0]); close(cpipe[1]);
+        const char* args[] = {
+            "ffmpeg", "-hide_banner", "-loglevel", "info",
+            "-f", "pipewire", "-i", type_spec.c_str(),
+            "-frames:v", "1", "-f", "null", "-", nullptr };
+        execvp("ffmpeg", const_cast<char* const*>(args));
+        _exit(127);   // exec failed (e.g. ffmpeg not in PATH)
+    }
+    close(cpipe[1]);
+
+    std::string buf;
+    char tmp[4096];
+    const auto t_start = std::chrono::steady_clock::now();
+    bool exited = false;
+    while (!exited) {
+        pollfd pfd{ cpipe[0], POLLIN, 0 };
+        const int pr = poll(&pfd, 1, 200);
+        if (pr > 0) {
+            const ssize_t n = read(cpipe[0], tmp, sizeof(tmp));
+            if (n > 0) buf.append(tmp, (size_t)n);
+        }
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) > 0) {
+            exited = true;
+            for (;;) {   // drain the remainder
+                pollfd p2{ cpipe[0], POLLIN, 0 };
+                if (poll(&p2, 1, 0) <= 0) break;
+                const ssize_t n = read(cpipe[0], tmp, sizeof(tmp));
+                if (n <= 0) break;
+                buf.append(tmp, (size_t)n);
+            }
+            break;
+        }
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        if (elapsed > timeout_s) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+            close(cpipe[0]);
+            err_out = "timed out waiting for the screen-share prompt / portal";
+            return false;
+        }
+    }
+    close(cpipe[0]);
+
+    // Parse the first WxH on the video stream line.
+    const std::string marker = "Stream #0:0: Video";
+    const size_t m = buf.find(marker);
+    if (m != std::string::npos) {
+        const size_t line_end = buf.find('\n', m);
+        size_t i = m;
+        while (i < buf.size() && (line_end == std::string::npos || i < line_end)) {
+            if (std::isdigit((unsigned char)buf[i])) {
+                size_t j = i;
+                while (j < buf.size() && std::isdigit((unsigned char)buf[j])) ++j;
+                if (j < buf.size() && buf[j] == 'x') {
+                    size_t k = j + 1;
+                    while (k < buf.size() && std::isdigit((unsigned char)buf[k])) ++k;
+                    if (k > j + 1) { size_out = buf.substr(i, k - i); return true; }
+                }
+                i = j;
+            } else ++i;
+        }
+    }
+    err_out = "no WxH in portal probe output";
+    const size_t err_hint = buf.rfind("Error");
+    if (err_hint != std::string::npos) {
+        const size_t e2 = buf.find('\n', err_hint);
+        err_out = buf.substr(err_hint,
+                             e2 == std::string::npos ? std::string::npos : e2 - err_hint);
+    }
+    const size_t nl = buf.rfind('\n');
+    if (nl != std::string::npos && buf.size() - nl > 2 && err_hint == std::string::npos)
+        err_out = buf.substr(nl + 1);
+    return false;
+}
+
+// Open the Wayland (portal/PipeWire) capture: probe the screen size, spawn
+// the rawvideo ffmpeg coprocess writing to a FIFO, and return an
+// AVFormatContext over that FIFO — the regular av_read_frame loop consumes
+// it exactly like an x11grab context.
+static AVFormatContext* open_wayland_capture(const CaptureConfig& cfg,
+                                             std::string& video_size_storage,
+                                             WaylandCapture& wc) {
+    if (std::system("command -v ffmpeg >/dev/null 2>&1") != 0) {
+        std::cerr << "[!] Wayland capture needs the 'ffmpeg' binary in PATH\n"
+                  << "    (its 'pipewire' input device speaks the portal).\n"
+                  << "    Check:  ffmpeg -hide_banner -formats | grep -i pipewire\n"
+                  << "    Or force the X11/XWayland path:  PSE_CAPTURE=x11 ./detector\n";
+        return nullptr;
+    }
+
+    std::string size, err;
+    std::cerr << "[*] Wayland screen capture via xdg-desktop-portal + PipeWire.\n"
+              << "    A 'share screen' permission dialog may appear — approve it.\n";
+    if (!wayland_portal_probe("type=screen", size, 180, err)) {
+        std::cerr << "[!] PipeWire/portal probe failed: " << err << "\n"
+                  << "    Is xdg-desktop-portal running?  Try PSE_CAPTURE=x11 to\n"
+                  << "    fall back to X11/XWayland (window) capture.\n";
+        return nullptr;
+    }
+    video_size_storage = size;
+
+    char dir_tmpl[] = "/tmp/pse_fw_XXXXXX";
+    char* dir = mkdtemp(dir_tmpl);
+    if (!dir) {
+        std::cerr << "[!] mkdtemp failed: " << std::strerror(errno) << "\n";
+        return nullptr;
+    }
+    wc.fifo_dir  = dir;
+    wc.fifo_path = std::string(dir) + "/stream";
+    if (mkfifo(wc.fifo_path.c_str(), 0600) != 0) {
+        std::cerr << "[!] mkfifo failed: " << std::strerror(errno) << "\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+
+    // O_RDWR anchor: unblocks the child's writer open and the demuxer's
+    // reader open regardless of startup ordering.
+    wc.rwfd = open(wc.fifo_path.c_str(), O_RDWR);
+    if (wc.rwfd < 0) {
+        std::cerr << "[!] open(FIFO) failed: " << std::strerror(errno) << "\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "[!] fork failed: " << std::strerror(errno) << "\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+    if (pid == 0) {
+        // Child: stdout → FIFO, then exec ffmpeg (no C++ runtime past this).
+        const int wfd = open(wc.fifo_path.c_str(), O_WRONLY);
+        if (wfd >= 0) dup2(wfd, 1);
+        if (wfd > 1) close(wfd);
+        close(wc.rwfd);
+        const char* args[] = {
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "pipewire", "-i", "type=screen",
+            "-an", "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-", nullptr };
+        execvp("ffmpeg", const_cast<char* const*>(args));
+        _exit(127);
+    }
+    wc.child_pid = pid;
+
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "video_size",   size.c_str(),  0);
+    av_dict_set(&opts, "pixel_format", "bgra",        0);
+    av_dict_set(&opts, "framerate",    cfg.framerate, 0);
+    AVFormatContext* ctx = nullptr;
+    const AVInputFormat* raw = av_find_input_format("rawvideo");
+    const int ret = avformat_open_input(&ctx, wc.fifo_path.c_str(), raw, &opts);
+    av_dict_free(&opts);
+    if (ret < 0) {
+        char e[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, e, sizeof(e));
+        std::cerr << "[!] Cannot open rawvideo capture stream: " << e << "\n";
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) > 0)
+            std::cerr << "    (ffmpeg coprocess exited early — check portal\n"
+                      << "     permissions / 'ffmpeg -f pipewire -i type=screen -f null -')\n";
+        wayland_capture_cleanup(&wc);
+        return nullptr;
+    }
+    wc.active = true;
+    std::cerr << "[*] Wayland capture live: " << size
+              << " @ " << cfg.framerate << " fps (portal/PipeWire)\n";
+    return ctx;
+}
+#endif  // __linux__
 
 // ============================================================================
 // open_screen_capture
@@ -4221,8 +4686,16 @@ static std::string query_display_geometry_linux(const char* display_env)
 //                    than buffering several seconds of frames to probe.
 // ============================================================================
 static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
-                                            std::string& video_size_storage)
+                                            std::string& video_size_storage,
+                                            void* wayland_wc)
 {
+#if defined(__linux__)
+    if (std::string(cfg.input_format) == "wayland_pipewire")
+        return wayland_wc
+            ? open_wayland_capture(cfg, video_size_storage,
+                                   *(WaylandCapture*)wayland_wc)
+            : nullptr;
+#endif
     // Must be called before any avformat_open_input with a device URL.
     avdevice_register_all();
 
@@ -4244,9 +4717,15 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
     // x11grab requires an explicit size.
     const char* vsize = cfg.video_size;
 #if defined(__linux__)
+    const bool window_id_mode =
+        (std::string(cfg.input_format) == "x11grab") &&
+        is_x11_window_id(cfg.device_url);
     if (!vsize) {
-        // Query X11 display geometry at runtime.
-        video_size_storage = query_display_geometry_linux(cfg.device_url);
+        // Window-ID capture: the window's own geometry.  Root capture:
+        // the X display geometry.
+        video_size_storage = window_id_mode
+            ? query_window_geometry_linux(cfg.device_url)
+            : query_display_geometry_linux(cfg.device_url);
         vsize = video_size_storage.c_str();
     }
 #endif
@@ -4269,9 +4748,11 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
     // Format: ":display.screen+x_offset,y_offset"
     std::string url_with_offset;
 #if defined(__linux__)
-    if (std::string(cfg.input_format) == "x11grab" && !strchr(cfg.device_url, '+')) {
+    if (std::string(cfg.input_format) == "x11grab" &&
+        !is_x11_window_id(cfg.device_url) && !strchr(cfg.device_url, '+')) {
         url_with_offset = std::string(cfg.device_url) + "+0,0";
-        // "+0,0" appends the top-left capture origin.
+        // "+0,0" appends the top-left capture origin (root capture only —
+        // a window-ID URL must reach x11grab verbatim).
     }
 #endif
     const char* open_url = url_with_offset.empty() ? cfg.device_url
@@ -4290,7 +4771,11 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
         if (std::string(cfg.input_format) == "kmsgrab")
             std::cerr << "    Hint: add yourself to the 'video' group or run with sudo.\n";
         if (std::string(cfg.input_format) == "x11grab")
-            std::cerr << "    Hint: ensure DISPLAY=" << cfg.device_url << " is accessible.\n";
+            std::cerr << "    Hint: ensure DISPLAY=" << (is_x11_window_id(cfg.device_url) ? "$DISPLAY" : cfg.device_url)
+                      << " is accessible."
+                      << (is_x11_window_id(cfg.device_url)
+                          ? " Get a window ID with: xwininfo -root -tree" : "")
+                      << "\n";
 #elif defined(__APPLE__)
         std::cerr << "    Hint: grant Screen Recording permission in System Settings → Privacy.\n";
 #endif
@@ -4315,8 +4800,18 @@ int main(int argc, char* argv[]) {
     std::string video_size_storage; // lifetime must outlive open_screen_capture
     CaptureConfig cfg = make_capture_config(argc, argv);
 
+#if defined(__linux__)
+    WaylandCapture wc_capture;   // portal/PipeWire coprocess state (Wayland)
+#endif
+
     // ── Open the screen capture device ───────────────────────────────────
-    AVFormatContext* fmt_ctx = open_screen_capture(cfg, video_size_storage);
+#if defined(__linux__)
+    AVFormatContext* fmt_ctx = open_screen_capture(cfg, video_size_storage,
+                                                   &wc_capture);
+#else
+    AVFormatContext* fmt_ctx = open_screen_capture(cfg, video_size_storage,
+                                                   nullptr);
+#endif
     if (!fmt_ctx) return -1;
 
     // avformat_find_stream_info on a live device buffers frames.
@@ -4479,7 +4974,9 @@ int main(int argc, char* argv[]) {
     DisplayProfile   dp = get_updated_display_profile();
 
     std::cout << "[+] loadv82 — dual-detector ITU-R BT.1702-3 PSE (fast 8-slot + slow 16-slot)\n"
-              << "    Device : " << cfg.input_format
+              << "    Device : "
+              << (std::string(cfg.input_format) == "wayland_pipewire"
+                      ? "wayland (pipewire/portal)" : cfg.input_format)
               << "  URL: "       << cfg.device_url << "\n"
               << "    Video  : " << cp->width << "x" << cp->height
               << "  FPS: "       << fps << "\n"
@@ -4499,6 +4996,7 @@ int main(int argc, char* argv[]) {
               << "    Workers: 4 total (w1+w2=fast, w3+w4=slow)\n"
               << "    Fixes  : dual-threshold | opposing-pair | concurrent-area\n"
               << "             | rising-edge-rate | sat-red | strobe-aware-motion-comp | patterns\n"
+              << "             | wayland-portal-capture\n"
               << "    Press Ctrl-C to stop.\n";
 
     // ── Detection speed capability summary ───────────────────────────────
@@ -4637,6 +5135,9 @@ int main(int argc, char* argv[]) {
     else                 run_capture.operator()<false, false>();
 
     // ── Cleanup ───────────────────────────────────────────────────────────
+#if defined(__linux__)
+    wayland_capture_cleanup(&wc_capture);   // stop the ffmpeg coprocess + FIFO
+#endif
     if (sws_ds)   sws_freeContext(sws_ds);
     if (ds_frame) av_frame_free(&ds_frame);
     if (yuv_frame) av_frame_free(&yuv_frame);
