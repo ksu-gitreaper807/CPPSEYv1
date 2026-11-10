@@ -1,0 +1,160 @@
+{
+  "measured_at_utc": "2026-11-10T10:59:50.645465+00:00",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12800H",
+  "platform": "Linux-7.3.1-1-cachyos-x86_64-with-glibc2.44",
+  "compiler": "g++ (GCC) 16.2.1 20260810",
+  "source_base_commit": "d24f118d45a6256ccba3327aa89463b178541782",
+  "binary_sha256": "e03bc573b3c652f056f47f5bc36dac4dc206e6bbff434038bf077bd28e190480",
+  "method": "Sequential synthetic harness subprocesses; diagnostics and protection disabled. One unmeasured warm-up per case, then repeated wall-clock measurements including startup, procedural pixels, conversion, fake downsampling, analysis and alarm output. Source-time alarm timestamps are not wall-clock latency. No live capture measured.",
+  "repeats": 3,
+  "cases": [
+    {
+      "label": "full-screen 3.0 Hz",
+      "case": "flash_hz",
+      "source_fps": 60,
+      "hz": 3.0,
+      "frames": 900,
+      "size": "1280x720",
+      "expectation": "pos",
+      "l1": 0,
+      "l2": 255,
+      "samples": [
+        {
+          "wall_seconds": 15.742768465999688,
+          "throughput_fps": 57.16910605296441,
+          "alarms": 1084,
+          "passed": true,
+          "first_alarm_source_seconds": 1.1
+        },
+        {
+          "wall_seconds": 15.117292033999547,
+          "throughput_fps": 59.53447204538054,
+          "alarms": 1084,
+          "passed": true,
+          "first_alarm_source_seconds": 1.1
+        },
+        {
+          "wall_seconds": 15.563075534000745,
+          "throughput_fps": 57.82918665618274,
+          "alarms": 1084,
+          "passed": true,
+          "first_alarm_source_seconds": 1.1
+        }
+      ],
+      "median_wall_seconds": 15.563075534000745,
+      "median_throughput_fps": 57.82918665618274,
+      "passed": true
+    },
+    {
+      "label": "full-screen 6.0 Hz",
+      "case": "flash_hz",
+      "source_fps": 60,
+      "hz": 6.0,
+      "frames": 900,
+      "size": "1280x720",
+      "expectation": "pos",
+      "l1": 0,
+      "l2": 255,
+      "samples": [
+        {
+          "wall_seconds": 17.379395806001412,
+          "throughput_fps": 51.78545963543877,
+          "alarms": 1381,
+          "passed": true,
+          "first_alarm_source_seconds": 0.52
+        },
+        {
+          "wall_seconds": 18.136422461999246,
+          "throughput_fps": 49.62389919432819,
+          "alarms": 1381,
+          "passed": true,
+          "first_alarm_source_seconds": 0.52
+        },
+        {
+          "wall_seconds": 18.287292252000043,
+          "throughput_fps": 49.21450303292271,
+          "alarms": 1381,
+          "passed": true,
+          "first_alarm_source_seconds": 0.52
+        }
+      ],
+      "median_wall_seconds": 18.136422461999246,
+      "median_throughput_fps": 49.62389919432819,
+      "passed": true
+    },
+    {
+      "label": "6.0 Hz @ 60fps, 1080p native",
+      "case": "flash_hz",
+      "source_fps": 60,
+      "hz": 6.0,
+      "frames": 600,
+      "size": "1920x1080",
+      "expectation": "pos",
+      "l1": 0,
+      "l2": 255,
+      "samples": [
+        {
+          "wall_seconds": 27.615028243999404,
+          "throughput_fps": 21.727299885357777,
+          "alarms": 901,
+          "passed": true,
+          "first_alarm_source_seconds": 0.52
+        },
+        {
+          "wall_seconds": 27.456874326000616,
+          "throughput_fps": 21.852450970058992,
+          "alarms": 901,
+          "passed": true,
+          "first_alarm_source_seconds": 0.52
+        },
+        {
+          "wall_seconds": 26.89288126500105,
+          "throughput_fps": 22.31073696000184,
+          "alarms": 901,
+          "passed": true,
+          "first_alarm_source_seconds": 0.52
+        }
+      ],
+      "median_wall_seconds": 27.456874326000616,
+      "median_throughput_fps": 21.852450970058992,
+      "passed": true
+    },
+    {
+      "label": "static grey",
+      "case": "static_gray",
+      "source_fps": 60,
+      "hz": 0,
+      "frames": 900,
+      "size": "1280x720",
+      "expectation": "neg",
+      "l1": 0,
+      "l2": 0,
+      "samples": [
+        {
+          "wall_seconds": 11.281582716999765,
+          "throughput_fps": 79.77604052344766,
+          "alarms": 0,
+          "passed": true,
+          "first_alarm_source_seconds": null
+        },
+        {
+          "wall_seconds": 12.224939554998855,
+          "throughput_fps": 73.61999590680874,
+          "alarms": 0,
+          "passed": true,
+          "first_alarm_source_seconds": null
+        },
+        {
+          "wall_seconds": 10.289733240000714,
+          "throughput_fps": 87.46582433267605,
+          "alarms": 0,
+          "passed": true,
+          "first_alarm_source_seconds": null
+        }
+      ],
+      "median_wall_seconds": 11.281582716999765,
+      "median_throughput_fps": 79.77604052344766,
+      "passed": true
+    }
+  ]
+}

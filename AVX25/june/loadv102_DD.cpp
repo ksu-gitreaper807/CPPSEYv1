@@ -72,6 +72,9 @@
 #include <unordered_map>
 #include <string_view>
 #include <csignal>
+#include <cstdlib>
+#include <stdexcept>
+#include "intervention_policy.hpp"
 #include "pse_probability.hpp"  // graded P-function (noforrest.hpp)
 
 // =============================================================================
@@ -151,6 +154,14 @@ private:
 };
 
 #define FUNC_TIMER(slot) FuncTimer _func_timer_##__LINE__(TimedFn::slot)
+
+static bool detailed_diagnostics_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("PSE_DIAGNOSTICS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 // Prints a summary table of all timed functions, sorted by total time
 // descending.  Call once at program exit (e.g. on Ctrl+C / loop exit).
@@ -2102,6 +2113,18 @@ class ScreenProtector {
 public:
     // ── Construction / destruction ────────────────────────────────────────
     ScreenProtector() {
+#if defined(PSE_TEST_HARNESS)
+        return;
+#endif
+        if (const char* disabled = std::getenv("PSE_NO_PROTECTION");
+            disabled && std::strcmp(disabled, "1") == 0) return;
+#if defined(__linux__)
+        if (std::getenv("WAYLAND_DISPLAY")) {
+            std::cerr << "[ScreenProtector] Wayland capture is active; XRandR gamma control "
+                         "cannot protect the physical display. Detection and alarms remain active.\n";
+            return;
+        }
+#endif
         if (!platform_init()) {
             std::cerr << "[ScreenProtector] Platform init failed — "
                          "screen protection disabled.\n";
@@ -2133,18 +2156,15 @@ public:
     // While P >= 0.45 (active flash) the post-flash hold deadline is refreshed
     // to now + 1000 ms so the 1-second extension begins from the last active
     // window, not from when the flash first started.
-    void update_from_probability(float P) noexcept {
-        if (P >= 0.70f) {
-            hold_until_ns_.store(now_ns() + 1'000'000'000LL,
-                                 std::memory_order_relaxed);
-            set_level(ProtectionLevel::BLACKOUT);
-        } else if (P >= 0.45f) {
-            hold_until_ns_.store(now_ns() + 1'000'000'000LL,
-                                 std::memory_order_relaxed);
-            set_level(ProtectionLevel::DIM);
-        } else {
-            // Flash ended — set NONE; worker_loop will honour the hold timer.
-            set_level(ProtectionLevel::NONE);
+    void update_from_detection(double elapsed_s, bool confirmed_flash,
+                               float probability) noexcept {
+        const auto decision = policy_.update(elapsed_s, confirmed_flash, probability);
+        if (confirmed_flash)
+            hold_until_ns_.store(now_ns() + 1'000'000'000LL, std::memory_order_relaxed);
+        switch (decision) {
+            case PSEInterventionLevel::BLACKOUT: set_level(ProtectionLevel::BLACKOUT); break;
+            case PSEInterventionLevel::DIM:      set_level(ProtectionLevel::DIM); break;
+            default:                             set_level(ProtectionLevel::NONE); break;
         }
     }
 
@@ -2163,6 +2183,7 @@ private:
     // for exactly 1000 ms after the last active flash window clears.
     // Zero = no hold active (startup state).
     std::atomic<int64_t> hold_until_ns_ { 0 };
+    PSEInterventionPolicy policy_{1.0};
 
     static int64_t now_ns() noexcept {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2209,7 +2230,7 @@ private:
                 }
                 platform_restore();
             } else if (target == ProtectionLevel::DIM) {
-                //platform_dim();
+                platform_dim();
             } else {
                 platform_blackout();
             }
@@ -2416,6 +2437,8 @@ struct PSEState {
     FlashRateCounter      rate_y, rate_r;
     SpatialDensityChecker density_y, density_r;
     ScreenProtector       screen;           // dim/blackout display protection
+    bool last_confirmed_flash = false;
+    float last_confirmed_probability = 0.0f;
 
     // FIX 4b (v103) — last valid flash population direction per channel.
     // -1 = FALL (b2d dominant), +1 = RISE (d2b dominant), 0 = none yet.
@@ -2499,6 +2522,8 @@ struct PSEState16 {
     int prev_dir_y = 0;
     int prev_dir_r = 0;
     // ScreenProtector is shared with fast detector — only one instance
+    bool last_confirmed_flash = false;
+    float last_confirmed_probability = 0.0f;
 
     std::vector<float> static_map_y;
     float              static_ema_alpha  = 0.05f;
@@ -3112,13 +3137,6 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
         // active_y_fraction stays 1.0 when nullified or when nothing is static.
     }
 
-    // Effective frame size after removing static background.
-    // Flash area fractions are divided by effective_y_pix rather than the full
-    // y_frame_size, giving a normalised "fraction of active area" measure.
-    const float effective_y_pix =
-        (float)buffer.y_frame_size * active_y_fraction;
-    const float effective_y_pix_safe = std::max(effective_y_pix, 1.0f);
-
     // =========================================================================
     // FIX 3 — Per-combo concurrent area (primary spatial criterion)
     //
@@ -3141,23 +3159,26 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     float max_concurrent_y = 0.0f, max_concurrent_r = 0.0f;
     int   peak_y = -1, peak_r = -1;
     {
-        const float inv_y = 1.0f / effective_y_pix_safe;
+        // Protection threshold uses the visible full frame. Long term static
+        // background subtraction may describe activity, but cannot turn a
+        // tiny bright patch into a whole-screen flash.
+        const float inv_y = 1.0f / (float)buffer.y_frame_size;
         const float inv_r = 1.0f / (float)buffer.v_frame_size;
         for (int i : kValidComboIndices) {
             float cy = (float)tracker.y_combo_hits[i] * inv_y;
             float cr = (float)tracker.r_combo_hits[i] * inv_r;
             if (cy > max_concurrent_y) { max_concurrent_y = cy; peak_y = i; }
-            if (cr > max_concurrent_r) { max_concurrent_r = cr; peak_r = i; }
+            if (cr > max_concurrent_r) max_concurrent_r = cr;
         }
     }
 
     // FIX 6 applied: effective_area_thresh scales up under scene motion.
-    const bool concurrent_y = (max_concurrent_y > effective_area_thresh);
-    const bool concurrent_r = (max_concurrent_r > effective_area_thresh);
+    const bool concurrent_y = (max_concurrent_y > 0.25f);
+    const bool concurrent_r = (max_concurrent_r > 0.25f);
 
     // FIX 5: saturated red area (independent of Michelson, at quarter resolution)
     const float sat_area = (float)sat_pixels_r / (float)buffer.v_frame_size;
-    const bool sat_red_flash = (sat_area > effective_area_thresh);
+    const bool sat_red_flash = (sat_area > 0.25f);
 
     // Secondary: integral-image local density (checker-board patterns)
     state.density_y.build(state.mask_cache_t1.data(), (int)state.mask_cache_t1.size(),
@@ -3171,8 +3192,9 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     const int rc = std::max(1, state.density_r.grid_w/5);
     const bool local_dense_r = state.density_r.has_dense_region(rw, rc, rw*rc*32/4);
 
-    const bool spatial_flash = concurrent_y || concurrent_r || sat_red_flash
-                             || local_dense_y || local_dense_r;
+    const bool spatial_y = concurrent_y;
+    const bool spatial_r = concurrent_r || sat_red_flash;
+    const bool spatial_flash = spatial_y || spatial_r || local_dense_y || local_dense_r;
 
     // =========================================================================
     // FIX 7 — Pattern detection (Guideline 2)
@@ -3284,9 +3306,9 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     //     population flip — uniform / co-spatial flashes)
     // record_state() records an onset timestamp on the false→true edge and
     // resets state on the true→false edge — no min_sep parameter needed.
-    const bool is_flashing_y = spatial_flash &&
+    const bool is_flashing_y = spatial_y &&
         ((has_d2b_y && has_b2d_y) || (flip_y && (has_d2b_y || has_b2d_y)));
-    const bool is_flashing_r = spatial_flash &&
+    const bool is_flashing_r = spatial_r &&
         ((has_d2b_r && has_b2d_r) || (flip_r && (has_d2b_r || has_b2d_r)));
     state.rate_y.record_state(is_flashing_y, pts_newest);
     state.rate_r.record_state(is_flashing_r, pts_newest);
@@ -3309,6 +3331,8 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     static constexpr double PSE_MIN_ALARM_HZ = 2.95;
     const bool y_gate = (pse_y && onset_hz_of(state.rate_y) >= PSE_MIN_ALARM_HZ);
     const bool r_gate = (pse_r && onset_hz_of(state.rate_r) >= PSE_MIN_ALARM_HZ);
+    state.last_confirmed_flash = (y_gate && spatial_y) || (r_gate && spatial_r);
+    state.last_confirmed_probability = 0.0f;
 
     // ── Output ────────────────────────────────────────────────────────────
     // All variables needed by pse_flash_probability are fully resolved here:
@@ -3318,7 +3342,8 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     //   effective_area_thresh               (FIX 6 — drift-corrected threshold)
     //   stripe_freq                         (FIX 7 — Guideline 2 patterns)
     //   rate_y/r.events_in_window           (FIX 4 — onset count)
-    if (total_flash_y > 0 || flash_r > 0 || sat_pixels_r > 0) {
+    if (detailed_diagnostics_enabled()
+        && (total_flash_y > 0 || flash_r > 0 || sat_pixels_r > 0)) {
         // FIX 9 timestamp: elapsed seconds since first captured frame.
         const double t0 = pts_to_elapsed(buffer.pts_buffer[f[0]], buffer);
 
@@ -3337,6 +3362,8 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
             stripe_freq,
             state.rate_y.events_in_window(pts_newest),
             state.rate_r.events_in_window(pts_newest));
+        if (state.last_confirmed_flash)
+            state.last_confirmed_probability = prob.P;
 
         std::cout << "[i] " << t0 << "s-" << pts_newest << "s"
                   << "  Y_conc=" << (max_concurrent_y * 100.f) << "%"
@@ -3436,8 +3463,6 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
         // reads the new level and applies the OS gamma/fade API without
         // blocking the analysis path.  The effect persists until the next
         // window clears the level back to NONE.
-        state.screen.update_from_probability(prob.P);
-
         // Elevated risk sub-bands: print component breakdown for warn/alarm.
         // This surfaces the dominant pathway (luma vs red vs pattern) for
         // content that is approaching but has not yet crossed the hard alarm.
@@ -3464,7 +3489,7 @@ void process_pse_temporal_avx_threaded(PSEBufferFast&       buffer,
     // pathway drove the alarm and what the probability was at alarm time.
     // This allows post-hoc analysis to distinguish near-miss alarms (P≈70%)
     // from confirmed severe events (P≈95%).
-    if ((y_gate || r_gate) && spatial_flash) {
+    if ((y_gate && spatial_y) || (r_gate && spatial_r)) {
         // Re-compute prob at alarm time (same call, cost is negligible).
         const auto alarm_prob = pse_flash_probability(
             max_concurrent_y * 100.f,
@@ -3539,6 +3564,8 @@ void process_pse_temporal_avx_threaded_16slot(
     const DisplayProfile& profile,
     PSEState16&          state) noexcept
 {
+    state.last_confirmed_flash = false;
+    state.last_confirmed_probability = 0.0f;
     FUNC_TIMER(ProcessSlowDetector);
     const int ci = (int)buffer.current_index;
     size_t f[16];
@@ -4043,58 +4070,30 @@ void process_pse_temporal_avx_threaded_16slot(
         tracker.y_b2d_hits[i]   = t1_y_b2d[i]    + t2_y_b2d[i];
     }
 
-    // Static fraction / active area
-    const int static_excl_y = static_excl_y_atomic.load(std::memory_order_relaxed);
-    int static_chunks_y = 0;
-    for (float v : state.static_map_y)
-        if (v < state.config.static_chunk_ema_thresh) ++static_chunks_y;
-    const int total_y_chunks = buffer.y_chunks;
-    const float static_frac_y = (total_y_chunks > 0)
-        ? (float)static_chunks_y / (float)total_y_chunks : 0.0f;
-    const float active_y_fraction = (static_frac_y < state.config.static_nullify_frac)
-        ? std::max(0.01f, 1.0f - static_frac_y) : 1.0f;
-    const float effective_y_pix_safe = std::max(
-        (float)buffer.y_frame_size * active_y_fraction, 1.0f);
-
     // FIX 3: per-combo concurrent area (16-slot, 256 combos)
     float max_concurrent_y = 0.0f, max_concurrent_r = 0.0f;
-    int   peak_y = -1, peak_r = -1;
+    int   peak_y = -1;
     {
-        const float inv_y = 1.0f / effective_y_pix_safe;
+        const float inv_y = 1.0f / (float)buffer.y_frame_size;
         const float inv_r = 1.0f / (float)buffer.v_frame_size;
         for (int i : kValidComboIndices_16) {
             float cy = (float)tracker.y_combo_hits[i] * inv_y;
             float cr = (float)tracker.r_combo_hits[i] * inv_r;
             if (cy > max_concurrent_y) { max_concurrent_y = cy; peak_y = i; }
-            if (cr > max_concurrent_r) { max_concurrent_r = cr; peak_r = i; }
+            if (cr > max_concurrent_r) max_concurrent_r = cr;
         }
     }
 
-    const bool concurrent_y  = (max_concurrent_y > effective_area_thresh);
-    const bool concurrent_r  = (max_concurrent_r > effective_area_thresh);
+    const bool concurrent_y  = (max_concurrent_y > 0.25f);
+    const bool concurrent_r  = (max_concurrent_r > 0.25f);
     const float sat_area      = (float)sat_pixels_r / (float)buffer.v_frame_size;
-    const bool sat_red_flash  = (sat_area > effective_area_thresh);
+    const bool sat_red_flash  = (sat_area > 0.25f);
 
     state.density_y.build(state.mask_cache_t1.data(), (int)state.mask_cache_t1.size(),
                           state.mask_cache_t2.data(), (int)state.mask_cache_t2.size());
-    state.density_r.build(state.r_mask_cache.data(), (int)state.r_mask_cache.size(),
-                          nullptr, 0);
-    const int yw = std::max(1, state.density_y.grid_h/5);
-    const int yc = std::max(1, state.density_y.grid_w/5);
-    const bool local_dense_y = state.density_y.has_dense_region(yw, yc, yw*yc*32/4);
-    const int rw = std::max(1, state.density_r.grid_h/5);
-    const int rc = std::max(1, state.density_r.grid_w/5);
-    const bool local_dense_r = state.density_r.has_dense_region(rw, rc, rw*rc*32/4);
-    const bool spatial_flash  = concurrent_y || concurrent_r || sat_red_flash
-                               || local_dense_y || local_dense_r;
-
+    const bool spatial_y = concurrent_y;
+    const bool spatial_r = concurrent_r || sat_red_flash;
     const float stripe_freq   = state.density_y.estimate_stripe_frequency();
-    bool pattern_violation    = false;
-    if (stripe_freq > 5.0f) {
-        float area      = (float)total_flash_y / (float)buffer.y_frame_size;
-        float pat_thresh = (scene_drift < 5.0f) ? 0.40f : 0.25f;
-        pattern_violation = (area > pat_thresh);
-    }
 
     // FIX 2: opposing-pair detection (256-combo grid)
     bool has_d2b_y = false, has_b2d_y = false;
@@ -4138,9 +4137,9 @@ void process_pse_temporal_avx_threaded_16slot(
     state.prev_dir_y = (dir_y_now != 0) ? dir_y_now : state.prev_dir_y;
     state.prev_dir_r = (dir_r_now != 0) ? dir_r_now : state.prev_dir_r;
 
-    const bool is_flashing_y = spatial_flash &&
+    const bool is_flashing_y = spatial_y &&
         ((has_d2b_y && has_b2d_y) || (flip_y && (has_d2b_y || has_b2d_y)));
-    const bool is_flashing_r = spatial_flash &&
+    const bool is_flashing_r = spatial_r &&
         ((has_d2b_r && has_b2d_r) || (flip_r && (has_d2b_r || has_b2d_r)));
     state.rate_y.record_state(is_flashing_y, pts_newest);
     state.rate_r.record_state(is_flashing_r, pts_newest);
@@ -4163,9 +4162,11 @@ void process_pse_temporal_avx_threaded_16slot(
     static constexpr double PSE_MIN_ALARM_HZ = 2.95;
     const bool y_gate = (pse_y && onset_hz_of(state.rate_y) >= PSE_MIN_ALARM_HZ);
     const bool r_gate = (pse_r && onset_hz_of(state.rate_r) >= PSE_MIN_ALARM_HZ);
+    state.last_confirmed_flash = (y_gate && spatial_y) || (r_gate && spatial_r);
 
     // Diagnostic output (prefixed [S] = slow detector)
-    if (total_flash_y > 0 || flash_r > 0 || sat_pixels_r > 0) {
+    if (detailed_diagnostics_enabled()
+        && (total_flash_y > 0 || flash_r > 0 || sat_pixels_r > 0)) {
         const double t0 = pts_to_elapsed(buffer.pts_buffer[f[0]], buffer);
         const int    max_sep_val = std::max(1, std::min(
             (int)(state.config.fps / (2.0 * 3.0)), 15));
@@ -4195,8 +4196,19 @@ void process_pse_temporal_avx_threaded_16slot(
                   << "\n" << std::defaultfloat;
     }
 
-    if ((y_gate || r_gate) && spatial_flash) {
+    if ((y_gate && spatial_y) || (r_gate && spatial_r)) {
+        const auto prob = pse_flash_probability(
+            max_concurrent_y * 100.f,
+            max_concurrent_r * 100.f,
+            sat_area * 100.f,
+            sign_changes,
+            effective_area_thresh * 100.f,
+            stripe_freq,
+            state.rate_y.events_in_window(pts_newest),
+            state.rate_r.events_in_window(pts_newest));
+        state.last_confirmed_probability = prob.P;
         std::cout << "\n[!!!][SLOW] PSE 3Hz FLASH ALARM  t=" << pts_newest << "s"
+                  << "  P=" << prob.P_pct << "% [" << prob.risk_label() << "]"
                   << "  Y onsets/s: " << state.rate_y.events_in_window(pts_newest)
                   << "  R onsets/s: " << state.rate_r.events_in_window(pts_newest)
                   << "  ConcY=" << (max_concurrent_y * 100.f) << "%"
@@ -4302,7 +4314,14 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
 {
     CaptureConfig cfg;
 
-#if defined(_WIN32)
+#if defined(PSE_TEST_HARNESS)
+    cfg.input_format = "synthetic";
+    cfg.device_url = "synthetic";
+    cfg.framerate = "60";
+    cfg.video_size = nullptr;
+    cfg.pixel_format = nullptr;
+    cfg.needs_swscale = true;
+#elif defined(_WIN32)
     cfg.input_format = "dxgigrab";
     cfg.device_url   = "desktop";          // entire primary desktop
     cfg.framerate    = "60";
@@ -4325,7 +4344,8 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
     const char* has_wayland  = std::getenv("WAYLAND_DISPLAY");
     const char* force        = std::getenv("PSE_CAPTURE");  // wayland|x11|kms
 
-    if (has_wayland && (!force || std::string(force) == "wayland")) {
+    if ((force && std::string(force) == "wayland")
+        || (has_wayland && *has_wayland && (!force || !*force))) {
         // Wayland session → xdg-desktop-portal + PipeWire (default).
         // On Plasma Wayland the X11 root window is an EMPTY background
         // surface even though XWayland sets DISPLAY, so x11grab would
@@ -4336,7 +4356,7 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
         cfg.video_size   = nullptr;        // probed at runtime (portal)
         cfg.pixel_format = nullptr;
         cfg.needs_swscale = true;          // PipeWire BGRA → BGR0 pipeline
-    } else if (!has_display && force && std::string(force) == "kms") {
+    } else if (force && std::string(force) == "kms") {
         // Bare-metal Wayland without the portal: kmsgrab (video group /
         // CAP_SYS_ADMIN).
         cfg.input_format = "kmsgrab";
@@ -4361,13 +4381,34 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
     // ":N[.S][+x,y]" or an X11 window ID → x11grab.
     if (argc > 1 && argv[1][0] != '\0') {
         cfg.device_url = argv[1];
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
         const std::string u = argv[1];
+        if (u == "desktop" || u == "auto")
+            cfg.device_url = std::strcmp(cfg.input_format, "wayland_pipewire") == 0
+                           ? "type=screen" : (has_display ? has_display : ":0.0");
         if (u == "wayland" || u.rfind("wayland:", 0) == 0)
             cfg.input_format = "wayland_pipewire";
-        else if (u[0] == ':' || is_x11_window_id(u.c_str()))
+        else if (is_x11_window_id(u.c_str()))
             cfg.input_format = "x11grab";
+        else if (u[0] == ':' && (!has_wayland || (force && std::string(force) == "x11")))
+            cfg.input_format = "x11grab";
+        else if (u[0] == ':' && has_wayland)
+            std::cerr << "[*] DISPLAY names XWayland in this session; using the monitor portal. "
+                         "Use PSE_CAPTURE=x11 for explicit X11 capture.\n";
+#endif
     }
     if (argc > 2 && argv[2][0] != '\0') cfg.framerate = argv[2];
+    char* fps_end = nullptr;
+    const double fps = std::strtod(cfg.framerate, &fps_end);
+    if (!fps_end || *fps_end || !std::isfinite(fps) || fps < 1 || fps > 240)
+        throw std::runtime_error("Frame rate must be a number between 1 and 240.");
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
+    if (force && *force && std::strcmp(force, "wayland") != 0
+        && std::strcmp(force, "x11") != 0 && std::strcmp(force, "kms") != 0)
+        throw std::runtime_error("PSE_CAPTURE must be wayland, x11, or kms.");
+    if (std::strcmp(cfg.input_format, "kmsgrab") == 0)
+        throw std::runtime_error("KMS DMA-BUF import is not implemented; use the Wayland portal or X11.");
+#endif
 
     return cfg;
 }
@@ -4384,7 +4425,8 @@ static CaptureConfig make_capture_config(int argc, char* argv[])
 static std::string query_display_geometry_linux(const char* display_env)
 {
     Display* dpy = XOpenDisplay(display_env);
-    if (!dpy) return "1920x1080";
+    if (!dpy) throw std::runtime_error(
+        "Cannot access the X11 display. In a Wayland session use ./detector wayland 60.");
     int screen = DefaultScreen(dpy);
     int w = XDisplayWidth(dpy, screen);
     int h = XDisplayHeight(dpy, screen);
@@ -4423,245 +4465,9 @@ static std::string query_window_geometry_linux(const char* window_id_str)
 }
 #endif
 
-// ============================================================================
-// Wayland capture — xdg-desktop-portal + PipeWire (Linux)
-//
-// On a Wayland session (e.g. KDE Plasma Wayland with rootless XWayland)
-// x11grab can only see the X11 ROOT window, which is just an empty
-// background surface — the real screen is composed by the Wayland
-// compositor and never touches X.  The standard Wayland capture path is
-// xdg-desktop-portal (RemoteDesktop), which delivers frames through
-// PipeWire.  FFmpeg's 'pipewire' input device implements exactly that
-// portal handshake, so this front end shells out:
-//
-//   probe : ffmpeg -f pipewire -i "type=screen" -frames:v 1 -f null -
-//           (triggers the screen-share permission prompt; parses WxH)
-//   live  : ffmpeg -f pipewire -i "type=screen" -f rawvideo -pix_fmt bgra -
-//           (stdout → FIFO → FFmpeg rawvideo demuxer → existing pipeline)
-//
-// The downstream pipeline is unchanged: PipeWire frames are 4-byte
-// B,G,R,α pixels — the same B,G,R bytes the BGR0→YUV420p converter
-// consumes (the 4th byte is ignored).
-// ============================================================================
-#if defined(__linux__)
-struct WaylandCapture {
-    pid_t       child_pid = -1;   // live ffmpeg coprocess
-    int         rwfd      = -1;   // O_RDWR anchor on the FIFO
-    std::string fifo_dir;
-    std::string fifo_path;
-    bool        active  = false;
-};
-
-static void wayland_capture_cleanup(WaylandCapture* wc) {
-    if (!wc || !wc->active) return;
-    if (wc->child_pid > 0) {
-        kill(wc->child_pid, SIGTERM);
-        int st = 0;
-        for (int i = 0; i < 100; ++i) {
-            if (waitpid(wc->child_pid, &st, WNOHANG) != 0) break;
-            usleep(20 * 1000);
-        }
-        waitpid(wc->child_pid, &st, 0);   // reap if it lingered
-        wc->child_pid = -1;
-    }
-    if (wc->rwfd >= 0) { close(wc->rwfd); wc->rwfd = -1; }
-    if (!wc->fifo_path.empty()) unlink(wc->fifo_path.c_str());
-    if (!wc->fifo_dir.empty())  rmdir(wc->fifo_dir.c_str());
-    wc->fifo_path.clear();
-    wc->fifo_dir.clear();
-    wc->active = false;
-}
-
-// Run a single-frame PipeWire/portal capture and parse the screen "WxH"
-// from ffmpeg's stream info.  The portal's screen-share prompt appears
-// during this call; blocks up to timeout_s waiting for the user to approve.
-static bool wayland_portal_probe(const std::string& type_spec,
-                                 std::string& size_out, int timeout_s,
-                                 std::string& err_out) {
-    int cpipe[2];
-    if (pipe(cpipe) != 0) { err_out = "pipe() failed"; return false; }
-
-    const pid_t pid = fork();
-    if (pid < 0) {
-        close(cpipe[0]); close(cpipe[1]);
-        err_out = "fork() failed"; return false;
-    }
-    if (pid == 0) {
-        // Child: stderr → pipe, then exec (no C++ runtime past this point).
-        dup2(cpipe[1], 2);
-        close(cpipe[0]); close(cpipe[1]);
-        const char* args[] = {
-            "ffmpeg", "-hide_banner", "-loglevel", "info",
-            "-f", "pipewire", "-i", type_spec.c_str(),
-            "-frames:v", "1", "-f", "null", "-", nullptr };
-        execvp("ffmpeg", const_cast<char* const*>(args));
-        _exit(127);   // exec failed (e.g. ffmpeg not in PATH)
-    }
-    close(cpipe[1]);
-
-    std::string buf;
-    char tmp[4096];
-    const auto t_start = std::chrono::steady_clock::now();
-    bool exited = false;
-    while (!exited) {
-        pollfd pfd{ cpipe[0], POLLIN, 0 };
-        const int pr = poll(&pfd, 1, 200);
-        if (pr > 0) {
-            const ssize_t n = read(cpipe[0], tmp, sizeof(tmp));
-            if (n > 0) buf.append(tmp, (size_t)n);
-        }
-        int st = 0;
-        if (waitpid(pid, &st, WNOHANG) > 0) {
-            exited = true;
-            for (;;) {   // drain the remainder
-                pollfd p2{ cpipe[0], POLLIN, 0 };
-                if (poll(&p2, 1, 0) <= 0) break;
-                const ssize_t n = read(cpipe[0], tmp, sizeof(tmp));
-                if (n <= 0) break;
-                buf.append(tmp, (size_t)n);
-            }
-            break;
-        }
-        const double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_start).count();
-        if (elapsed > timeout_s) {
-            kill(pid, SIGKILL);
-            waitpid(pid, &st, 0);
-            close(cpipe[0]);
-            err_out = "timed out waiting for the screen-share prompt / portal";
-            return false;
-        }
-    }
-    close(cpipe[0]);
-
-    // Parse the first WxH on the video stream line.
-    const std::string marker = "Stream #0:0: Video";
-    const size_t m = buf.find(marker);
-    if (m != std::string::npos) {
-        const size_t line_end = buf.find('\n', m);
-        size_t i = m;
-        while (i < buf.size() && (line_end == std::string::npos || i < line_end)) {
-            if (std::isdigit((unsigned char)buf[i])) {
-                size_t j = i;
-                while (j < buf.size() && std::isdigit((unsigned char)buf[j])) ++j;
-                if (j < buf.size() && buf[j] == 'x') {
-                    size_t k = j + 1;
-                    while (k < buf.size() && std::isdigit((unsigned char)buf[k])) ++k;
-                    if (k > j + 1) { size_out = buf.substr(i, k - i); return true; }
-                }
-                i = j;
-            } else ++i;
-        }
-    }
-    err_out = "no WxH in portal probe output";
-    const size_t err_hint = buf.rfind("Error");
-    if (err_hint != std::string::npos) {
-        const size_t e2 = buf.find('\n', err_hint);
-        err_out = buf.substr(err_hint,
-                             e2 == std::string::npos ? std::string::npos : e2 - err_hint);
-    }
-    const size_t nl = buf.rfind('\n');
-    if (nl != std::string::npos && buf.size() - nl > 2 && err_hint == std::string::npos)
-        err_out = buf.substr(nl + 1);
-    return false;
-}
-
-// Open the Wayland (portal/PipeWire) capture: probe the screen size, spawn
-// the rawvideo ffmpeg coprocess writing to a FIFO, and return an
-// AVFormatContext over that FIFO — the regular av_read_frame loop consumes
-// it exactly like an x11grab context.
-static AVFormatContext* open_wayland_capture(const CaptureConfig& cfg,
-                                             std::string& video_size_storage,
-                                             WaylandCapture& wc) {
-    if (std::system("command -v ffmpeg >/dev/null 2>&1") != 0) {
-        std::cerr << "[!] Wayland capture needs the 'ffmpeg' binary in PATH\n"
-                  << "    (its 'pipewire' input device speaks the portal).\n"
-                  << "    Check:  ffmpeg -hide_banner -formats | grep -i pipewire\n"
-                  << "    Or force the X11/XWayland path:  PSE_CAPTURE=x11 ./detector\n";
-        return nullptr;
-    }
-
-    std::string size, err;
-    std::cerr << "[*] Wayland screen capture via xdg-desktop-portal + PipeWire.\n"
-              << "    A 'share screen' permission dialog may appear — approve it.\n";
-    if (!wayland_portal_probe("type=screen", size, 180, err)) {
-        std::cerr << "[!] PipeWire/portal probe failed: " << err << "\n"
-                  << "    Is xdg-desktop-portal running?  Try PSE_CAPTURE=x11 to\n"
-                  << "    fall back to X11/XWayland (window) capture.\n";
-        return nullptr;
-    }
-    video_size_storage = size;
-
-    char dir_tmpl[] = "/tmp/pse_fw_XXXXXX";
-    char* dir = mkdtemp(dir_tmpl);
-    if (!dir) {
-        std::cerr << "[!] mkdtemp failed: " << std::strerror(errno) << "\n";
-        return nullptr;
-    }
-    wc.fifo_dir  = dir;
-    wc.fifo_path = std::string(dir) + "/stream";
-    if (mkfifo(wc.fifo_path.c_str(), 0600) != 0) {
-        std::cerr << "[!] mkfifo failed: " << std::strerror(errno) << "\n";
-        wayland_capture_cleanup(&wc);
-        return nullptr;
-    }
-
-    // O_RDWR anchor: unblocks the child's writer open and the demuxer's
-    // reader open regardless of startup ordering.
-    wc.rwfd = open(wc.fifo_path.c_str(), O_RDWR);
-    if (wc.rwfd < 0) {
-        std::cerr << "[!] open(FIFO) failed: " << std::strerror(errno) << "\n";
-        wayland_capture_cleanup(&wc);
-        return nullptr;
-    }
-
-    const pid_t pid = fork();
-    if (pid < 0) {
-        std::cerr << "[!] fork failed: " << std::strerror(errno) << "\n";
-        wayland_capture_cleanup(&wc);
-        return nullptr;
-    }
-    if (pid == 0) {
-        // Child: stdout → FIFO, then exec ffmpeg (no C++ runtime past this).
-        const int wfd = open(wc.fifo_path.c_str(), O_WRONLY);
-        if (wfd >= 0) dup2(wfd, 1);
-        if (wfd > 1) close(wfd);
-        close(wc.rwfd);
-        const char* args[] = {
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "pipewire", "-i", "type=screen",
-            "-an", "-f", "rawvideo", "-pix_fmt", "bgra",
-            "-", nullptr };
-        execvp("ffmpeg", const_cast<char* const*>(args));
-        _exit(127);
-    }
-    wc.child_pid = pid;
-
-    AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "video_size",   size.c_str(),  0);
-    av_dict_set(&opts, "pixel_format", "bgra",        0);
-    av_dict_set(&opts, "framerate",    cfg.framerate, 0);
-    AVFormatContext* ctx = nullptr;
-    const AVInputFormat* raw = av_find_input_format("rawvideo");
-    const int ret = avformat_open_input(&ctx, wc.fifo_path.c_str(), raw, &opts);
-    av_dict_free(&opts);
-    if (ret < 0) {
-        char e[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, e, sizeof(e));
-        std::cerr << "[!] Cannot open rawvideo capture stream: " << e << "\n";
-        int st = 0;
-        if (waitpid(pid, &st, WNOHANG) > 0)
-            std::cerr << "    (ffmpeg coprocess exited early — check portal\n"
-                      << "     permissions / 'ffmpeg -f pipewire -i type=screen -f null -')\n";
-        wayland_capture_cleanup(&wc);
-        return nullptr;
-    }
-    wc.active = true;
-    std::cerr << "[*] Wayland capture live: " << size
-              << " @ " << cfg.framerate << " fps (portal/PipeWire)\n";
-    return ctx;
-}
-#endif  // __linux__
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
+#include "linux_capture.hpp"
+#endif
 
 // ============================================================================
 // open_screen_capture
@@ -4689,10 +4495,10 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
                                             std::string& video_size_storage,
                                             void* wayland_wc)
 {
-#if defined(__linux__)
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
     if (std::string(cfg.input_format) == "wayland_pipewire")
         return wayland_wc
-            ? open_wayland_capture(cfg, video_size_storage,
+            ? open_wayland_capture(cfg.framerate, video_size_storage,
                                    *(WaylandCapture*)wayland_wc)
             : nullptr;
 #endif
@@ -4716,7 +4522,7 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
     // Capture resolution.  dxgigrab and avfoundation infer this automatically;
     // x11grab requires an explicit size.
     const char* vsize = cfg.video_size;
-#if defined(__linux__)
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
     const bool window_id_mode =
         (std::string(cfg.input_format) == "x11grab") &&
         is_x11_window_id(cfg.device_url);
@@ -4728,6 +4534,7 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
             : query_display_geometry_linux(cfg.device_url);
         vsize = video_size_storage.c_str();
     }
+    if (window_id_mode) av_dict_set(&opts, "window_id", cfg.device_url, 0);
 #endif
     if (vsize) av_dict_set(&opts, "video_size", vsize, 0);
 
@@ -4757,8 +4564,25 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
 #endif
     const char* open_url = url_with_offset.empty() ? cfg.device_url
                                                     : url_with_offset.c_str();
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
+    if (window_id_mode) {
+        const char* display = std::getenv("DISPLAY");
+        if (!display || !*display) {
+            av_dict_free(&opts);
+            throw std::runtime_error("X11 window capture requires DISPLAY.");
+        }
+        open_url = display;
+    }
+#endif
 
     AVFormatContext* fmt_ctx = nullptr;
+#if !defined(PSE_TEST_HARNESS)
+    fmt_ctx = avformat_alloc_context();
+    if (!fmt_ctx) { av_dict_free(&opts); return nullptr; }
+    fmt_ctx->interrupt_callback.callback = [](void*) {
+        return g_shutdown_requested.load(std::memory_order_relaxed) ? 1 : 0;
+    };
+#endif
     int ret = avformat_open_input(&fmt_ctx, open_url, ifmt, &opts);
     av_dict_free(&opts);
 
@@ -4787,7 +4611,24 @@ static AVFormatContext* open_screen_capture(const CaptureConfig& cfg,
 // ============================================================================
 // main
 // ============================================================================
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) try {
+    if (argc > 1 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
+        std::cout << "Usage: detector [desktop|wayland|DISPLAY|window-id [fps]]\n"
+                     "Wayland: ./detector wayland 60 (select the physical monitor).\n"
+                     "X11: PSE_CAPTURE=x11 ./detector \"$DISPLAY\" 60\n"
+                     "PSE_NO_PROTECTION=1 disables gamma changes; Wayland reports alarms only.\n"
+                     "PSE_MAX_FRAMES=N stops after N frames; Ctrl+C stops capture.\n"
+                     "PSE_TEST_CAPTURE=1 uses generated video without opening the portal.\n"
+                     "PSE_DIAGNOSTICS=1 prints per-frame detector details.\n";
+        return 0;
+    }
+    long long max_frames = 0, captured_frames = 0;
+    if (const char* value = std::getenv("PSE_MAX_FRAMES")) {
+        char* end = nullptr;
+        max_frames = std::strtoll(value, &end, 10);
+        if (!*value || *end || max_frames < 0)
+            throw std::runtime_error("PSE_MAX_FRAMES must be a nonnegative integer.");
+    }
     auto start_t = std::chrono::high_resolution_clock::now();
 
     // Graceful shutdown: Ctrl+C (SIGINT) or `kill` (SIGTERM) sets a flag
@@ -4799,13 +4640,21 @@ int main(int argc, char* argv[]) {
     // ── Build platform capture config ────────────────────────────────────
     std::string video_size_storage; // lifetime must outlive open_screen_capture
     CaptureConfig cfg = make_capture_config(argc, argv);
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
+    const char* test_source_env = std::getenv("PSE_TEST_CAPTURE");
+    if (test_source_env && std::strcmp(test_source_env, "1") == 0) {
+        cfg.input_format = "wayland_pipewire";
+        cfg.device_url = "test-source";
+        cfg.needs_swscale = true;
+    }
+#endif
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
     WaylandCapture wc_capture;   // portal/PipeWire coprocess state (Wayland)
 #endif
 
     // ── Open the screen capture device ───────────────────────────────────
-#if defined(__linux__)
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
     AVFormatContext* fmt_ctx = open_screen_capture(cfg, video_size_storage,
                                                    &wc_capture);
 #else
@@ -4816,7 +4665,8 @@ int main(int argc, char* argv[]) {
 
     // avformat_find_stream_info on a live device buffers frames.
     // With analyzeduration=0 this returns after reading a single packet.
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+    const bool portal_capture = std::strcmp(cfg.input_format, "wayland_pipewire") == 0;
+    if (!portal_capture && avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
         std::cerr << "[!] Cannot find stream info.\n";
         avformat_close_input(&fmt_ctx);
         return -1;
@@ -4835,6 +4685,8 @@ int main(int argc, char* argv[]) {
     // There is no entropy decoding; avcodec_receive_frame copies the packet
     // data into the AVFrame planes with no further processing.
     AVCodecParameters* cp    = fmt_ctx->streams[v_idx]->codecpar;
+    if (cp->width < 2 || cp->height < 2 || (cp->width & 1) || (cp->height & 1))
+        throw std::runtime_error("Capture requires positive, even pixel dimensions.");
     const AVCodec*     codec = avcodec_find_decoder(cp->codec_id);
     if (!codec) {
         std::cerr << "[!] No decoder for codec id " << cp->codec_id << "\n";
@@ -5056,12 +4908,53 @@ int main(int argc, char* argv[]) {
     // they are constant and leaves the branches in the hot path.  We template
     // the inner loop on both flags so the compiler eliminates each dead branch
     // at instantiation time.  The outer dispatch runs once before the loop.
+    int64_t previous_pts = -1;
+    int64_t first_capture_pts = -1;
+    uint64_t capture_gaps = 0;
     auto run_capture = [&]<bool NEEDS_SWSCALE, bool DS_ENABLED>() {
         while (!g_shutdown_requested.load(std::memory_order_relaxed)
-               && av_read_frame(fmt_ctx, pkt) >= 0) {
+               && (max_frames == 0 || captured_frames < max_frames)) {
+            int read_result;
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
+            read_result = portal_capture ? wc_capture.read_packet(pkt) : av_read_frame(fmt_ctx, pkt);
+#else
+            read_result = av_read_frame(fmt_ctx, pkt);
+#endif
+            if (read_result < 0) break;
             if (pkt->stream_index == v_idx) {
                 if (avcodec_send_packet(cc, pkt) >= 0) {
                     while (avcodec_receive_frame(cc, frame) >= 0) {
+#if !defined(PSE_TEST_HARNESS)
+                        if (frame->width != cp->width || frame->height != cp->height
+                            || frame->linesize[0] < frame->width * 4
+                            || (frame->format != AV_PIX_FMT_BGR0 && frame->format != AV_PIX_FMT_BGRA))
+                            throw std::runtime_error("Capture geometry or pixel format changed; restart capture.");
+                        if (frame->pts == AV_NOPTS_VALUE)
+                            throw std::runtime_error("Capture frame is missing a source timestamp.");
+#endif
+                        if (previous_pts >= 0 && frame->pts <= previous_pts) {
+                            av_frame_unref(frame);
+                            continue;
+                        }
+                        if (previous_pts >= 0 && (frame->pts - previous_pts) * tb > std::max(0.25, 4.0 / fps)) {
+                            // No transitions or onset rates may span a capture outage.
+                            buf.stored_frames = buf.current_index = 0;
+                            buf16.stored_frames = buf16.current_index = 0;
+                            state.rate_y = state.rate_r = FlashRateCounter{};
+                            state16.rate_y = state16.rate_r = FlashRateCounter{};
+                            state.prev_dir_y = state.prev_dir_r = 0;
+                            state16.prev_dir_y = state16.prev_dir_r = 0;
+                            state.diag = {};
+                            state16.diag = {};
+                            std::fill(state.static_map_y.begin(), state.static_map_y.end(), 0.0f);
+                            std::fill(state16.static_map_y.begin(), state16.static_map_y.end(), 0.0f);
+                            ++capture_gaps;
+                            if (detailed_diagnostics_enabled())
+                                std::cerr << "[*] Capture gap: cleared temporal history.\n";
+                        }
+                        if (first_capture_pts < 0) first_capture_pts = frame->pts;
+                        previous_pts = frame->pts;
+                        ++captured_frames;
 
                         // ── BGR0→YUV420p conversion (Y + Cr only) ───────────
                         AVFrame* yuv = frame;
@@ -5118,6 +5011,15 @@ int main(int argc, char* argv[]) {
                             process_pse_temporal_avx_threaded_16slot(
                                 buf16, w3, w4, dp, state16);
 
+                        const double elapsed_s =
+                            (double)(frame->pts - buf.first_pts) * tb;
+                        const bool confirmed = state.last_confirmed_flash
+                                            || state16.last_confirmed_flash;
+                        const float probability = std::max(
+                            state.last_confirmed_flash ? state.last_confirmed_probability : 0.0f,
+                            state16.last_confirmed_flash ? state16.last_confirmed_probability : 0.0f);
+                        state.screen.update_from_detection(elapsed_s, confirmed, probability);
+
                         av_frame_unref(frame);
                     }
                 }
@@ -5135,7 +5037,7 @@ int main(int argc, char* argv[]) {
     else                 run_capture.operator()<false, false>();
 
     // ── Cleanup ───────────────────────────────────────────────────────────
-#if defined(__linux__)
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
     wayland_capture_cleanup(&wc_capture);   // stop the ffmpeg coprocess + FIFO
 #endif
     if (sws_ds)   sws_freeContext(sws_ds);
@@ -5152,5 +5054,19 @@ int main(int argc, char* argv[]) {
               << " ms\n";
 
     print_timing_report();
+    std::cout << "[+] Captured " << captured_frames << " frames.\n";
+    if (captured_frames > 1 && previous_pts > first_capture_pts) {
+        const double stream_seconds = (previous_pts - first_capture_pts) * tb;
+        std::cout << "[+] Source cadence: " << std::fixed << std::setprecision(1)
+                  << ((captured_frames - 1) / stream_seconds) << " fps; "
+                  << capture_gaps << " long capture gap(s).\n" << std::defaultfloat;
+    }
+#if defined(__linux__) && !defined(PSE_TEST_HARNESS)
+    return wc_capture.failed && !g_shutdown_requested.load() ? 1 : 0;
+#else
     return 0;
+#endif
+} catch (const std::exception& error) {
+    std::cerr << "[!] " << error.what() << "\n";
+    return 1;
 }

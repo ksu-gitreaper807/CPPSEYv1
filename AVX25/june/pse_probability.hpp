@@ -1,7 +1,9 @@
 // pse_probability.hpp  —  loadv66 add-on
 //
-// Graded epileptic flash probability P ∈ [0, 1] derived from the parameters
-// already computed inside process_pse_temporal_avx_threaded().
+// Graded flash risk score P ∈ [0, 1] derived from the parameters already
+// computed inside process_pse_temporal_avx_threaded(). This is a heuristic,
+// not a calibrated clinical probability or confirmation of a flash. Display
+// intervention must additionally require the detector's confirmed-flash gate.
 //
 // ── Integration point ────────────────────────────────────────────────────────
 //
@@ -56,9 +58,10 @@
 //   Physical argument for area_trust:
 //     Camera pan causes a global luma shift that distributes the per-pixel
 //     argmin/argmax attribution across DIFFERENT frame-pairs — concurrent area
-//     stays low.  A genuine flash locks a large concurrent area to the SAME
-//     frame-pair transition.  When c_max ≥ 50%, the only explanation is a real
-//     flash, so drift_trust → 0 and thr_c collapses to 25% (base).
+//     stays low. A flash can lock a large concurrent area to the SAME
+//     frame-pair transition. When c_max ≥ 50%, drift_trust → 0 and thr_c
+//     collapses to 25% (base). A scene cut can do this too; temporal
+//     confirmation must come from the detector, not this score.
 //
 //   Physical argument for osc_trust:
 //     FIX 6's strobe-bypass fires when sign_changes ≥ 3.  For a 3 Hz flash at
@@ -83,7 +86,7 @@
 //   P_red  = P_sat  × W_rt                  sat-red risk
 //   P_pat  = P_str  × 0.70                  stripe risk (capped 70%)
 //
-// Step 5 — Union of independent pathways
+// Step 5 — Bounded union of heuristic pathways
 //   P = 1 - (1 - P_core)(1 - P_red)(1 - P_pat)    P ∈ [0, 1]
 //
 // ── Risk bands ────────────────────────────────────────────────────────────────
@@ -92,12 +95,9 @@
 //   P < 0.70  →  warn   strong spatial evidence, rate building
 //   P ≥ 0.70  →  alarm  approaching or exceeding ITU criteria
 //
-// ── Verified test cases ───────────────────────────────────────────────────────
-//   ezgif.mp4  w1 (or=1): P ≈ 42%  watch  — spatial overwhelming, rate starting
-//   ezgif.mp4  w5 (or=2): P ≈ 49%  watch  — escalating
-//   flash_3hz  (or=0):    P ≈ 24%  watch  — false negative recovered from 0%
-//   safe content:         P ≈ 0.2% safe
-//   confirmed alarm:      P ≈ 92%  alarm
+// These pathways share inputs; the union is a risk aggregation rule, not an
+// assumption that the evidence is statistically independent. Saturated red
+// or stripes alone can raise the score without establishing temporal flashes.
 // =============================================================================
 
 #pragma once
@@ -162,11 +162,19 @@ struct PSEProbResult {
     int   or_r) noexcept
 {
     // ── Step 1: Normalise ────────────────────────────────────────────────
-    const float c_max = std::max(y_conc_pct, r_conc_pct) / 100.0f;
-    const float sat   = sat_r_pct   / 100.0f;
-    const float eff   = athresh_pct / 100.0f;
+    // Reject non-finite evidence and bound each channel before combining it;
+    // otherwise a NaN channel can hide valid evidence in the other channel.
+    const auto percent = [](float value) noexcept {
+        return std::isfinite(value) ? std::clamp(value, 0.0f, 100.0f) : 0.0f;
+    };
+    const float c_max = std::max(percent(y_conc_pct), percent(r_conc_pct)) / 100.0f;
+    const float sat   = percent(sat_r_pct) / 100.0f;
+    const float eff   = std::isfinite(athresh_pct)
+        ? std::clamp(athresh_pct, 25.0f, 60.0f) / 100.0f : 0.25f;
     constexpr float base = 0.25f;
-    const int rate = std::max(oy, or_r);
+    const int rate = std::max(0, std::max(oy, or_r));
+    osc = std::clamp(osc, 0, 7);
+    stripes = std::isfinite(stripes) ? std::max(0.0f, stripes) : 0.0f;
 
     // ── Step 2: Drift-corrected threshold ────────────────────────────────
     const float area_trust  = std::max(0.0f, std::min(1.0f, 1.0f - c_max / 0.50f));
@@ -178,18 +186,18 @@ struct PSEProbResult {
     const float spatial_margin = (thr_c > 0.0f) ? (c_max / thr_c) : 0.0f;
     const float P_sp  = pse_sigmoid(6.0f  * (spatial_margin - 1.0f));
     const float P_sat = pse_sigmoid(8.0f  * (sat / 0.25f    - 1.0f));
-    const float P_osc = 0.60f + 0.72f * pse_sigmoid(3.5f * (static_cast<float>(osc) - 3.0f));
+    const float P_osc = 0.60f + 0.40f * pse_sigmoid(3.5f * (static_cast<float>(osc) - 3.0f));
     const float P_rt  = pse_sigmoid(1.8f  * (static_cast<float>(rate) - 3.0f));
     const float P_str = pse_sigmoid(2.5f  * (stripes - 5.0f));
 
     // ── Step 4: Sub-scores ────────────────────────────────────────────────
     const float P_luma = P_sp * P_osc;
-    const float W_rt   = 0.62f + 0.60f * P_rt;
+    const float W_rt   = 0.40f + 0.60f * P_rt;
     const float P_core = P_luma * W_rt;
     const float P_red  = P_sat  * W_rt;
     const float P_pat  = P_str  * 0.70f;
 
-    // ── Step 5: Union of independent pathways ─────────────────────────────
+    // ── Step 5: Bounded union of heuristic pathways ───────────────────────
     const float P = std::max(0.0f, std::min(1.0f,
         1.0f - (1.0f - P_core) * (1.0f - P_red) * (1.0f - P_pat)));
 

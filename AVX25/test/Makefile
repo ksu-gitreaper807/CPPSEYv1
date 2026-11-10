@@ -7,19 +7,25 @@
 #   make            — build build/detector_harness
 #   make clean
 #
-# See README.md for usage and the evaluation matrix.
+# See ../README.md for usage and benchmark methodology.
 
 CXX      ?= g++
-CXXFLAGS ?= -O3 -mavx2 -mfma -mbmi2 -mpopcnt -std=c++17 -pthread -Wall -I fakeff
+CXXFLAGS ?= -O3 -mavx2 -mfma -mbmi2 -mpopcnt -std=c++20 -pthread -Wall -I fakeff -DPSE_TEST_HARNESS=1
 SRC      = ../june/loadv102_DD.cpp
 OBJ      = fakeff_impl.cpp scenarios.cpp
 BIN      = build/detector_harness
 
-$(BIN): $(SRC) $(OBJ) $(wildcard fakeff/*.h)
+all: $(BIN) build/sensitivity_tests
+
+$(BIN): Makefile $(SRC) $(OBJ) $(wildcard ../june/*.hpp) $(shell find fakeff -name '*.h')
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(OBJ)
+
+build/sensitivity_tests: sensitivity_tests.cpp $(wildcard ../june/*.hpp)
+	@mkdir -p build
+	$(CXX) -O2 -std=c++20 -Wall -I ../june -o $@ sensitivity_tests.cpp
 
 clean:
 	rm -rf build results
 
-.PHONY: clean
+.PHONY: all clean
