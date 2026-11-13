@@ -28,7 +28,7 @@ make check
 make benchmark
 ```
 
-`make check` runs the standalone probability/intervention checks, Python
+`make check` runs the standalone probability/intervention checks, Python checks
 detector and portal regressions, and the integrated FFmpeg capture path with
 generated video. It does not open a screen-sharing prompt.
 
